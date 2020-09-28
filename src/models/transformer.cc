@@ -2,7 +2,8 @@
 
 #include <cmath>
 
-#include "../device_dispatch.h"
+#include "device_dispatch.h"
+#include "type_dispatch.h"
 
 namespace ctranslate2 {
   namespace models {
@@ -34,10 +35,10 @@ namespace ctranslate2 {
       return name;
     }
 
-    TransformerModel::TransformerModel(const std::string& path,
+    TransformerModel::TransformerModel(ModelReader& model_reader,
                                        size_t spec_revision,
                                        size_t num_heads)
-      : Model(path, spec_revision)
+      : SequenceToSequenceModel(model_reader, spec_revision)
       , _num_heads(num_heads) {
     }
 
@@ -53,15 +54,30 @@ namespace ctranslate2 {
       return 3;
     }
 
+    bool TransformerModel::is_quantizable(const std::string& variable_name) const {
+      return ends_with(variable_name, "weight");
+    }
+
+    bool TransformerModel::is_linear_weight(const std::string& variable_name) const {
+      // Linear weights are all variables that are quantizable and not under the "embeddings" scope.
+      return is_quantizable(variable_name) && variable_name.find("embeddings") == std::string::npos;
+    }
+
+    bool TransformerModel::is_packable(const std::string& variable_name) const {
+      // Disallow packing for the last linear layer which can be dynamically masked.
+      return (is_linear_weight(variable_name)
+              && variable_name.find("projection") == std::string::npos);
+    }
+
     void TransformerModel::register_variable(const std::string& name, StorageView& variable) {
       std::string var_name = name;
       if (_spec_revision == 1)
         var_name = map_v1_variable_name(name);
-      Model::register_variable(var_name, variable);
+      SequenceToSequenceModel::register_variable(var_name, variable);
     }
 
     void TransformerModel::finalize() {
-      Model::finalize();
+      SequenceToSequenceModel::finalize();
       if (_spec_revision >= 3)
         _num_heads = get_variable("num_heads").as_scalar<int8_t>();
       _with_relative_position = get_flag_with_default("with_relative_position", false);
@@ -87,23 +103,28 @@ namespace ctranslate2 {
     void PositionEncoder::operator()(StorageView& input, dim_t index) {
       const dim_t max_time = input.dim(1);
       const dim_t depth = input.dim(-1);
-      const StorageView& encodings = get_position_encoding(max_time, depth, input.device());
+      const StorageView& encodings = get_position_encoding(max_time,
+                                                           depth,
+                                                           input.device(),
+                                                           input.dtype());
       DEVICE_DISPATCH(input.device(),
-                      primitives<D>::add_batch_broadcast(encodings.data<float>() + index * depth,
-                                                         input.data<float>(),
-                                                         max_time * depth,
-                                                         input.size()));
+                      TYPE_DISPATCH(input.dtype(),
+                                    primitives<D>::add_batch_broadcast(encodings.data<T>() + index * depth,
+                                                                       input.data<T>(),
+                                                                       max_time * depth,
+                                                                       input.size())));
     }
 
     const StorageView& PositionEncoder::get_position_encoding(dim_t max_time,
                                                               dim_t depth,
-                                                              Device device) {
+                                                              Device device,
+                                                              DataType dtype) {
       if (_model_encoding)
         return *_model_encoding;
 
       static const dim_t default_max_time = 500;
       if (!_generated_encoding)
-        _generated_encoding.reset(new StorageView(device));
+        _generated_encoding.reset(new StorageView(dtype, device));
 
       if (_generated_encoding->empty() || max_time > _generated_encoding->dim(0)) {
         dim_t reserved_time = (_generated_encoding->empty()
@@ -129,7 +150,7 @@ namespace ctranslate2 {
 
         StorageView cache;
         ops::Concat(-1)({&sin_encoding, &cos_encoding}, cache);
-        *_generated_encoding = cache.to(device);
+        *_generated_encoding = cache.to(dtype).to(device);
       }
 
       return *_generated_encoding;
@@ -143,8 +164,8 @@ namespace ctranslate2 {
       , _ff2(model, scope + "/linear_1") {
     }
 
-    void TransformerFeedForward::operator()(const StorageView& input, StorageView& output) {
-      StorageView inner(input.device());
+    void TransformerFeedForward::operator()(const StorageView& input, StorageView& output) const {
+      StorageView inner(input.dtype(), input.device());
       _layer_norm(input, output);
       _ff1(output, inner);
       ops::ReLU()(inner, inner);
@@ -164,42 +185,52 @@ namespace ctranslate2 {
 
     void TransformerEncoderLayer::operator()(const StorageView& input,
                                              const StorageView& lengths,
-                                             StorageView& output) {
+                                             StorageView& output,
+                                             const Padder* padder) const {
       PROFILE("TransformerEncoderLayer");
-      StorageView context(input.device());
-      _self_attention(input, nullptr, &lengths, context);
+      StorageView context(input.dtype(), input.device());
+      _self_attention(input, nullptr, &lengths, context, nullptr, nullptr, nullptr, padder);
       _ff(context, output);
     }
 
 
     TransformerDecoderLayer::TransformerDecoderLayer(const TransformerModel& model,
-                                                     const std::string& scope)
+                                                     const std::string& scope,
+                                                     const bool with_encoder_attention)
       : _self_attention(model,
                         scope + "/self_attention",
                         model.num_heads(),
                         /*self_attention=*/true)
-      , _encoder_attention(model,
-                           scope + "/attention",
-                           model.num_heads(),
-                           /*self_attention=*/false)
+      , _encoder_attention(with_encoder_attention
+                           ? new layers::MultiHeadAttention(model,
+                                                            scope + "/attention",
+                                                            model.num_heads(),
+                                                            /*self_attention=*/false)
+                           : nullptr)
       , _ff(model, scope + "/ffn") {
     }
 
     void TransformerDecoderLayer::operator()(const StorageView& input,
-                                             const StorageView& memory,
-                                             const StorageView& memory_lengths,
+                                             const StorageView* memory,
+                                             const StorageView* memory_lengths,
                                              StorageView& cached_self_attn_keys,
                                              StorageView& cached_self_attn_values,
-                                             StorageView& cached_attn_keys,
-                                             StorageView& cached_attn_values,
+                                             StorageView* cached_attn_keys,
+                                             StorageView* cached_attn_values,
                                              StorageView& output,
-                                             StorageView* attention) {
+                                             StorageView* attention,
+                                             const Padder* padder) const {
       PROFILE("TransformerDecoderLayer");
-      StorageView context(input.device());
-      _self_attention(input, nullptr, nullptr, output,
-                      &cached_self_attn_keys, &cached_self_attn_values);
-      _encoder_attention(output, &memory, &memory_lengths, context,
-                         &cached_attn_keys, &cached_attn_values, attention);
+      StorageView context(input.dtype(), input.device());
+      if (_encoder_attention) {
+        _self_attention(input, nullptr, nullptr, output,
+                        &cached_self_attn_keys, &cached_self_attn_values);
+        (*_encoder_attention)(output, memory, memory_lengths, context,
+                              cached_attn_keys, cached_attn_values, attention, padder);
+      } else {
+        _self_attention(input, nullptr, nullptr, context,
+                        &cached_self_attn_keys, &cached_self_attn_values);
+      }
       _ff(context, output);
     }
 
@@ -223,26 +254,46 @@ namespace ctranslate2 {
       }
     }
 
+    DataType TransformerEncoder::output_type() const {
+      return _output_norm.output_type();
+    }
+
+    dim_t TransformerEncoder::output_size() const {
+      return _output_norm.output_size();
+    }
+
     void TransformerEncoder::operator()(const StorageView& ids,
                                         const StorageView& lengths,
                                         StorageView& output) {
       PROFILE("TransformerEncoder");
-      StorageView input(output.device());
+      StorageView input(output.dtype(), output.device());
       _embeddings(ids, input);
       if (_position_encoder)
         (*_position_encoder)(input);
 
+      // Remove padding to reduce the amount of computation.
+      std::unique_ptr<Padder> padder;
+      if (Padder::allow_padding_removal(output.device(), output.dtype())) {
+        padder.reset(new Padder(lengths, input.dim(1)));
+        padder->remove_padding(input);
+      }
+
       for (size_t l = 0; l < _layers.size(); ++l) {
-        (*_layers[l])(input, lengths, output);
+        (*_layers[l])(input, lengths, output, padder.get());
         if (l + 1 < _layers.size())
-          swap(input, output);
+          input = std::move(output);
       }
       _output_norm(output, output);
+      if (padder)
+        padder->add_padding(output);
     }
 
 
-    TransformerDecoder::TransformerDecoder(const TransformerModel& model, const std::string& scope)
+    TransformerDecoder::TransformerDecoder(const TransformerModel& model,
+                                           const std::string& scope,
+                                           const bool with_encoder_attention)
       : Decoder(model.device())
+      , _with_encoder_attention(with_encoder_attention)
       , _embeddings(model, scope + "/embeddings")
       , _position_encoder(model.with_relative_position()
                           ? nullptr
@@ -252,7 +303,8 @@ namespace ctranslate2 {
       for (size_t l = 0;; ++l) {
         try {
           _layers.emplace_back(new TransformerDecoderLayer(model,
-                                                           scope + "/layer_" + std::to_string(l)));
+                                                           scope + "/layer_" + std::to_string(l),
+                                                           with_encoder_attention));
         } catch (std::exception&) {
           if (l == 0)
             throw;
@@ -262,55 +314,87 @@ namespace ctranslate2 {
       }
     }
 
-    void TransformerDecoder::reduce_vocab(const StorageView& ids) {
-      if (!ids.empty())
-        _proj.mask_weights(ids);
-      else
-        _proj.reset_mask();
+    DataType TransformerDecoder::output_type() const {
+      return _proj.output_type();
+    }
+
+    dim_t TransformerDecoder::output_size() const {
+      return _proj.output_size();
+    }
+
+    void TransformerDecoder::set_vocabulary_mask(const StorageView& ids) {
+      _proj.mask_weights(ids);
+    }
+
+    void TransformerDecoder::reset_vocabulary_mask() {
+      _proj.reset_mask();
     }
 
     layers::DecoderState TransformerDecoder::initial_state() const {
+      const DataType dtype = output_type();
       layers::DecoderState state;
       for (size_t i = 0; i < _layers.size(); ++i) {
-        state.emplace("self_keys_" + std::to_string(i), StorageView(_device));
-        state.emplace("self_values_" + std::to_string(i), StorageView(_device));
-        state.emplace("memory_keys_" + std::to_string(i), StorageView(_device));
-        state.emplace("memory_values_" + std::to_string(i), StorageView(_device));
+        const std::string i_str = std::to_string(i);
+        state.emplace("self_keys_" + i_str, StorageView(dtype, _device));
+        state.emplace("self_values_" + i_str, StorageView(dtype, _device));
+        if (_with_encoder_attention) {
+          state.emplace("memory_keys_" + i_str, StorageView(dtype, _device));
+          state.emplace("memory_values_" + i_str, StorageView(dtype, _device));
+        }
       }
       return state;
     }
 
     bool TransformerDecoder::should_reorder_state(const std::string& name) const {
       // No need to reorder projected memory keys and values as they are the same for each beam.
-      return !starts_with(name, "memory");
+      return !_with_encoder_attention || !starts_with(name, "memory");
     }
 
     void TransformerDecoder::operator()(dim_t step,
                                         const StorageView& ids,
-                                        const StorageView& memory,
-                                        const StorageView& memory_lengths,
                                         layers::DecoderState& state,
                                         StorageView* logits,
                                         StorageView* attention) {
       PROFILE("TransformerDecoder");
-      StorageView layer_in(ids.device());
-      StorageView layer_out(ids.device());
+      StorageView layer_in(output_type(), ids.device());
+      StorageView layer_out(output_type(), ids.device());
 
       _embeddings(ids, layer_in);
       if (_position_encoder)
         (*_position_encoder)(layer_in, step);
 
+      StorageView* memory = nullptr;
+      const StorageView* memory_lengths = nullptr;
+      std::unique_ptr<Padder> memory_padder;
+      if (_with_encoder_attention) {
+        memory_lengths = &state.at("memory_lengths");
+        if (step == 0) {
+          memory = &state.at("memory");
+          if (Padder::allow_padding_removal(memory->device(), memory->dtype())) {
+            memory_padder.reset(new Padder(*memory_lengths, memory->dim(1)));
+            memory_padder->remove_padding(*memory);
+          }
+        }
+      }
+
       for (size_t l = 0; l < _layers.size(); ++l) {
+        const std::string l_str = std::to_string(l);
         (*_layers[l])(layer_in,
                       memory,
                       memory_lengths,
-                      state.at("self_keys_" + std::to_string(l)),
-                      state.at("self_values_" + std::to_string(l)),
-                      state.at("memory_keys_" + std::to_string(l)),
-                      state.at("memory_values_" + std::to_string(l)),
+                      state.at("self_keys_" + l_str),
+                      state.at("self_values_" + l_str),
+                      _with_encoder_attention ? &state.at("memory_keys_" + l_str) : nullptr,
+                      _with_encoder_attention ? &state.at("memory_values_" + l_str) : nullptr,
                       layer_out,
-                      l + 1 == _layers.size() ? attention : nullptr);
-        swap(layer_in, layer_out);
+                      l + 1 == _layers.size() ? attention : nullptr,
+                      memory_padder.get());
+        layer_in = std::move(layer_out);
+      }
+
+      if (step == 0) {
+        // The memory is no longer needed as its projections were cached in the first step.
+        state.erase("memory");
       }
 
       if (logits) {

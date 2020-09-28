@@ -1,17 +1,13 @@
 #include "ctranslate2/ops/concat.h"
 
-#include "../device_dispatch.h"
+#include "device_dispatch.h"
+#include "type_dispatch.h"
 
 namespace ctranslate2 {
   namespace ops {
 
     Concat::Concat(int axis)
       : _axis(axis) {
-    }
-
-    void Concat::operator()(const std::vector<StorageView*>& inputs,
-                            std::vector<StorageView*>& outputs) const {
-      operator()(inputs, *outputs[0]);
     }
 
     void Concat::operator()(const std::vector<StorageView*>& inputs,

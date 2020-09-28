@@ -1,3 +1,4 @@
+import io
 import os
 import pybind11
 
@@ -6,6 +7,11 @@ from setuptools import setup, find_packages, Extension
 
 include_dirs = [pybind11.get_include()]
 library_dirs = []
+
+def _get_long_description():
+    readme_path = os.path.join(os.path.dirname(__file__), "..", "README.md")
+    with io.open(readme_path, encoding="utf-8") as readme_file:
+        return readme_file.read()
 
 def _maybe_add_library_root(lib_name):
   if "%s_ROOT" % lib_name in os.environ:
@@ -29,9 +35,11 @@ ctranslate2_module = Extension(
 
 setup(
     name="ctranslate2",
-    version="1.6.2",
+    version="1.13.2",
     license="MIT",
-    description="Optimized inference engine for OpenNMT models",
+    description="Fast inference engine for OpenNMT models",
+    long_description=_get_long_description(),
+    long_description_content_type="text/markdown",
     author="OpenNMT",
     author_email="guillaume.klein@systrangroup.com",
     url="https://opennmt.net",

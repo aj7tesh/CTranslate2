@@ -1,45 +1,83 @@
 #include "ctranslate2/storage_view.h"
 
-#include "./device_dispatch.h"
+#include "device_dispatch.h"
+#include "type_dispatch.h"
 
 #define PRINT_MAX_VALUES 6
-#define GUARD_DIM(DIM, RANK)                                            \
-  do {                                                                  \
-    if (DIM >= RANK)                                                    \
-      THROW_INVALID_ARGUMENT("can't index dimension "                   \
-                             + std::to_string(DIM)                      \
-                             + " for a storage with rank "              \
-                             + std::to_string(RANK));                   \
-  } while (false)
 
 namespace ctranslate2 {
 
+  static inline int get_current_device(const Device device) {
+    int index = 0;
+    DEVICE_DISPATCH(device, index = primitives<D>::get_device());
+    return index;
+  }
+
   StorageView::StorageView(DataType type, Device device)
     : _dtype(type)
-    , _device(device) {
+    , _device(device)
+    , _device_index(get_current_device(device)) {
   }
 
   StorageView::StorageView(Device device, DataType type)
     : _dtype(type)
-    , _device(device) {
+    , _device(device)
+    , _device_index(get_current_device(device)) {
   }
 
   StorageView::StorageView(const Shape& shape, DataType type, Device device)
     : _dtype(type)
-    , _device(device) {
+    , _device(device)
+    , _device_index(get_current_device(device)) {
     resize(shape);
-    TYPE_DISPATCH(type, fill(T()));
+  }
+
+  template <typename T>
+  StorageView::StorageView(const Shape& shape, T init, Device device)
+    : _dtype(DataTypeToEnum<T>::value)
+    , _device(device)
+    , _device_index(get_current_device(device)) {
+    resize(shape);
+    fill(init);
+  }
+
+  template <typename T>
+  StorageView::StorageView(T scalar, Device device)
+    : _dtype(DataTypeToEnum<T>::value)
+    , _device(device)
+    , _device_index(get_current_device(device)) {
+    resize({});
+    fill(scalar);
+  }
+
+  template <typename T>
+  StorageView::StorageView(const Shape& shape, const std::vector<T>& init, Device device)
+    : _dtype(DataTypeToEnum<T>::value)
+    , _device(device)
+    , _device_index(get_current_device(device)) {
+    resize(shape);
+    copy_from(init.data(), init.size(), Device::CPU);
+  }
+
+  template <typename T>
+  StorageView::StorageView(const Shape& shape, T* data, Device device)
+    : _dtype(DataTypeToEnum<T>::value)
+    , _device(device)
+    , _device_index(get_current_device(device)) {
+    view(data, shape);
   }
 
   StorageView::StorageView(const StorageView& other)
     : _dtype(other._dtype)
-    , _device(other._device) {
+    , _device(other._device)
+    , _device_index(other._device_index) {
     assign(other);
   }
 
   StorageView::StorageView(StorageView&& other)
     : _dtype(other._dtype)
-    , _device(other._device) {
+    , _device(other._device)
+    , _device_index(other._device_index) {
     assign(std::move(other));
   }
 
@@ -47,17 +85,35 @@ namespace ctranslate2 {
     release();
   }
 
-  Device StorageView::device() const {
-    return _device;
-  }
-
   StorageView StorageView::to(Device device) const {
     StorageView device_copy(_shape, _dtype, device);
     return device_copy.copy_from(*this);
   }
 
-  DataType StorageView::dtype() const {
-    return _dtype;
+  StorageView StorageView::to(DataType dtype) const {
+    if (_dtype == dtype)
+      return *this;
+    StorageView converted(_shape, dtype, _device);
+    if (_dtype == DataType::FLOAT && dtype == DataType::FLOAT16) {
+      DEVICE_DISPATCH(_device,
+                      primitives<D>::convert(data<float>(), converted.data<float16_t>(), _size));
+    } else if (_dtype == DataType::FLOAT16 && dtype == DataType::FLOAT) {
+      DEVICE_DISPATCH(_device,
+                      primitives<D>::convert(data<float16_t>(), converted.data<float>(), _size));
+    } else {
+      // TODO: support other conversions.
+      throw std::invalid_argument("Conversion from " + dtype_name(_dtype)
+                                  + " to " + dtype_name(dtype) + " is not yet implemented");
+    }
+    return converted;
+  }
+
+  StorageView StorageView::to_float16() const {
+    return to(DataType::FLOAT16);
+  }
+
+  StorageView StorageView::to_float() const {
+    return to(DataType::FLOAT);
   }
 
   dim_t StorageView::reserved_memory() const {
@@ -74,7 +130,7 @@ namespace ctranslate2 {
 
   StorageView& StorageView::release() {
     if (_own_data && _data != nullptr) {
-      DEVICE_DISPATCH(_device, primitives<D>::free_data(_data));
+      DEVICE_DISPATCH(_device, primitives<D>::free_data(_data, _device_index));
     }
     _data = nullptr;
     _allocated_size = 0;
@@ -87,7 +143,7 @@ namespace ctranslate2 {
     release();
     dim_t required_bytes = 0;
     TYPE_DISPATCH(_dtype, required_bytes = size * sizeof (T));
-    DEVICE_DISPATCH(_device, _data = primitives<D>::alloc_data(required_bytes));
+    DEVICE_DISPATCH(_device, _data = primitives<D>::alloc_data(required_bytes, _device_index));
     if (_data == nullptr)
       THROW_RUNTIME_ERROR("failed to allocated memory");
     _own_data = true;
@@ -95,38 +151,8 @@ namespace ctranslate2 {
     return *this;
   }
 
-  dim_t StorageView::rank() const {
-    return _shape.size();
-  }
-
-  const Shape& StorageView::shape() const {
-    return _shape;
-  }
-
-  dim_t StorageView::dim(dim_t dim) const {
-    if (dim < 0)
-      dim = _shape.size() + dim;
-    GUARD_DIM(dim, rank());
-    return _shape[dim];
-  }
-
-  dim_t StorageView::stride(dim_t dim) const {
-    if (dim < 0)
-      dim = _shape.size() + dim;
-    GUARD_DIM(dim, rank());
-    return compute_stride(_shape, dim);
-  }
-
-  dim_t StorageView::size() const {
-    return _size;
-  }
-
-  bool StorageView::is_scalar() const {
-    return _size == 1 && _shape.empty();
-  }
-
-  bool StorageView::empty() const {
-    return _size == 0;
+  bool StorageView::owns_data() const {
+    return _own_data;
   }
 
   StorageView& StorageView::reshape(const Shape& new_shape) {
@@ -200,12 +226,15 @@ namespace ctranslate2 {
   }
 
   StorageView& StorageView::assign(const StorageView& other) {
-    ASSERT_COMPATIBLE(other._dtype, other._device);
+    if (_device != other._device || _device_index != other._device_index)
+      release();
+    _device = other._device;
+    _device_index = other._device_index;
+    _dtype = other._dtype;
     return copy_from(other);
   }
 
   StorageView& StorageView::assign(StorageView&& other) {
-    ASSERT_COMPATIBLE(other._dtype, other._device);
     swap(*this, other);
     return *this;
   }
@@ -219,8 +248,11 @@ namespace ctranslate2 {
   }
 
   StorageView& StorageView::shallow_copy(StorageView& other) {
-    ASSERT_DEVICE(other._device);
+    _dtype = other._dtype;
     TYPE_DISPATCH(_dtype, view(other.data<T>(), other._shape));
+    // Device info should be set after view(), which releases memory on the current device.
+    _device = other._device;
+    _device_index = other._device_index;
     return *this;
   }
 
@@ -236,17 +268,69 @@ namespace ctranslate2 {
     return _data;
   }
 
+  template <typename T>
+  T* StorageView::data() {
+    ASSERT_DTYPE(DataTypeToEnum<T>::value);
+    return static_cast<T*>(_data);
+  }
+
+  template <typename T>
+  const T* StorageView::data() const {
+    ASSERT_DTYPE(DataTypeToEnum<T>::value);
+    return static_cast<const T*>(_data);
+  }
+
+  template <typename T>
+  std::vector<T> StorageView::to_vector() const {
+    if (_device != Device::CPU)
+      return to(Device::CPU).to_vector<T>();
+    ASSERT_DTYPE(DataTypeToEnum<T>::value);
+    const T* begin = data<T>();
+    const T* end = begin + _size;
+    return std::vector<T>(begin, end);
+  }
+
+  template <typename T>
+  T* StorageView::index(const std::vector<dim_t>& indices) {
+    return const_cast<T*>(static_cast<const StorageView&>(*this).index<T>(indices));
+  }
+
+  template <typename T>
+  const T* StorageView::index(const std::vector<dim_t>& indices) const {
+    ASSERT_DTYPE(DataTypeToEnum<T>::value);
+    dim_t offset = 0;
+    for (size_t i = 0; i < indices.size(); ++i)
+      offset += indices[i] * stride(i);
+    if (offset >= _size)
+      THROW_INVALID_ARGUMENT("computed index is out of bounds ("
+                             + std::to_string(offset) + " >= "
+                             + std::to_string(_size) + ")");
+    return data<T>() + offset;
+  }
+
   StorageView& StorageView::copy_from(const StorageView& other) {
     resize_as(other);
     TYPE_DISPATCH(other._dtype, copy_from(other.data<T>(), other._size, other._device));
     return *this;
   }
 
-  template <typename T>
-  T StorageView::scalar_at(const std::vector<dim_t>& indices) const {
-    T scalar = T();
-    DEVICE_DISPATCH(_device, scalar = primitives<D>::deref(index<T>(indices), 0));
+  template <typename U>
+  U StorageView::scalar_at(const std::vector<dim_t>& indices) const {
+    auto scalar = U();
+    DEVICE_DISPATCH(_device,
+                    TYPE_DISPATCH(_dtype, scalar = primitives<D>::deref(index<T>(indices), 0)));
     return scalar;
+  }
+
+  template <typename T>
+  StorageView& StorageView::view(T* data, const Shape& shape) {
+    ASSERT_DTYPE(DataTypeToEnum<T>::value);
+    release();
+    _data = static_cast<void*>(data);
+    _own_data = false;
+    _allocated_size = compute_size(shape);
+    _size = _allocated_size;
+    return reshape(shape);
   }
 
   template <typename T>
@@ -262,7 +346,7 @@ namespace ctranslate2 {
     if (size != _size)
       THROW_INVALID_ARGUMENT("buffer to copy is of size " + std::to_string(size)
                              + " but current storage size is " + std::to_string(_size));
-#ifdef WITH_CUDA
+#ifdef CT2_WITH_CUDA
     if (device != _device) {
       if (device == Device::CUDA)
         cross_device_primitives<Device::CUDA, Device::CPU>::copy(data, this->data<T>(), size);
@@ -327,7 +411,7 @@ namespace ctranslate2 {
         }
       }
       os << std::endl);
-    os << "[" << device_to_str(storage.device())
+    os << "[" << device_to_str(storage.device()) << ':' << storage._device_index
        << " " << dtype_name(storage.dtype()) << " storage viewed as ";
     if (storage.is_scalar())
       os << "scalar";
@@ -345,6 +429,7 @@ namespace ctranslate2 {
   void swap(StorageView& a, StorageView& b) {
     std::swap(a._dtype, b._dtype);
     std::swap(a._device, b._device);
+    std::swap(a._device_index, b._device_index);
     std::swap(a._data, b._data);
     std::swap(a._own_data, b._own_data);
     std::swap(a._allocated_size, b._allocated_size);
@@ -353,8 +438,24 @@ namespace ctranslate2 {
   }
 
 #define DECLARE_IMPL(T)                                                 \
+  template                                                              \
+  StorageView::StorageView(const Shape& shape, T init, Device device);  \
+  template StorageView::StorageView(T scalar, Device device);           \
+  template                                                              \
+  StorageView::StorageView(const Shape& shape,                          \
+                           const std::vector<T>& init,                  \
+                           Device device);                              \
+  template                                                              \
+  StorageView::StorageView(const Shape& shape, T* data, Device device); \
+  template T* StorageView::data();                                      \
+  template const T* StorageView::data() const;                          \
+  template std::vector<T> StorageView::to_vector() const;               \
+  template T* StorageView::index(const std::vector<dim_t>& indices);    \
+  template const T*                                                     \
+  StorageView::index(const std::vector<dim_t>& indices) const;          \
   template T                                                            \
   StorageView::scalar_at(const std::vector<dim_t>& indices) const;      \
+  template StorageView& StorageView::view(T* data, const Shape& shape); \
   template StorageView& StorageView::fill(T value);                     \
   template StorageView&                                                 \
   StorageView::copy_from(const T* data, dim_t size, Device device);

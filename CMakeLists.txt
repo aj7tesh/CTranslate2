@@ -8,7 +8,10 @@ endif()
 project(ctranslate2)
 
 option(WITH_MKL "Compile with Intel MKL backend" ON)
+option(WITH_DNNL "Compile with DNNL backend" OFF)
 option(WITH_CUDA "Compile with CUDA backend" OFF)
+option(WITH_TENSORRT "Compile with TensorRT (required for TopK with k > 1)" ON)
+option(ENABLE_CPU_DISPATCH "Compile CPU kernels for multiple ISA and dispatch at runtime" ON)
 option(ENABLE_PROFILING "Compile with profiling support" OFF)
 option(LIB_ONLY "Do not compile clients" OFF)
 option(WITH_TESTS "Compile the tests" OFF)
@@ -16,7 +19,7 @@ option(BUILD_SHARED_LIBS "Build shared libraries" ON)
 
 if(ENABLE_PROFILING)
   message(STATUS "Enable profiling support")
-  add_definitions(-DENABLE_PROFILING)
+  add_definitions(-DCT2_ENABLE_PROFILING)
 endif()
 
 if(DEFINED ENV{INTELROOT})
@@ -56,27 +59,39 @@ endif()
 
 find_package(Threads)
 
-set(INCLUDE_DIRECTORIES
+set(PUBLIC_INCLUDE_DIRECTORIES
   ${CMAKE_CURRENT_SOURCE_DIR}/include
+  )
+set(PRIVATE_INCLUDE_DIRECTORIES
+  ${CMAKE_CURRENT_SOURCE_DIR}/src
+  ${CMAKE_CURRENT_SOURCE_DIR}/third_party
   )
 set(SOURCES
   src/decoding.cc
   src/devices.cc
+  src/cpu/backend.cc
+  src/cpu/cpu_info.cc
+  src/cpu/cpu_isa.cc
+  src/cpu/kernels.cc
   src/layers/attention.cc
   src/layers/decoder.cc
   src/layers/common.cc
   src/models/model.cc
+  src/models/sequence_to_sequence.cc
   src/models/transformer.cc
   src/ops/add.cc
+  src/ops/min_max.cc
   src/ops/concat.cc
   src/ops/concat_split_cpu.cc
   src/ops/dequantize.cc
+  src/ops/dequantize_cpu.cc
   src/ops/gather.cc
   src/ops/gather_cpu.cc
   src/ops/gelu.cc
   src/ops/gemm.cc
   src/ops/layer_norm.cc
   src/ops/layer_norm_cpu.cc
+  src/ops/log.cc
   src/ops/matmul.cc
   src/ops/mul.cc
   src/ops/multinomial.cc
@@ -91,7 +106,9 @@ set(SOURCES
   src/ops/topk_cpu.cc
   src/ops/transpose.cc
   src/ops/quantize.cc
+  src/ops/quantize_cpu.cc
   src/primitives/cpu.cc
+  src/padder.cc
   src/profiler.cc
   src/sampling.cc
   src/storage_view.cc
@@ -108,6 +125,29 @@ set(LIBRARIES
   ${CMAKE_THREAD_LIBS_INIT}
   )
 
+macro(ct2_compile_kernels_for_isa isa flag)
+  configure_file(
+    src/cpu/kernels.cc
+    ${CMAKE_CURRENT_BINARY_DIR}/kernels_${isa}.cc
+    COPYONLY)
+  set_source_files_properties(
+    ${CMAKE_CURRENT_BINARY_DIR}/kernels_${isa}.cc
+    PROPERTIES COMPILE_FLAGS ${flag})
+  list(APPEND SOURCES ${CMAKE_CURRENT_BINARY_DIR}/kernels_${isa}.cc)
+endmacro()
+
+if(ENABLE_CPU_DISPATCH)
+  message(STATUS "Compiling for multiple CPU ISA and enabling runtime dispatch")
+  add_definitions(-DCT2_WITH_CPU_DISPATCH)
+  if(WIN32)
+    ct2_compile_kernels_for_isa(avx "/arch:AVX")
+    ct2_compile_kernels_for_isa(avx2 "/arch:AVX2")
+  else()
+    ct2_compile_kernels_for_isa(avx "-mavx")
+    ct2_compile_kernels_for_isa(avx2 "-mavx2")
+  endif()
+endif()
+
 if(NOT OPENMP_RUNTIME STREQUAL "NONE")
   if(NOT WIN32)
     find_package(OpenMP)
@@ -118,7 +158,8 @@ if(NOT OPENMP_RUNTIME STREQUAL "NONE")
 
   if(OPENMP_RUNTIME STREQUAL "INTEL")
     # Find Intel libraries.
-    find_library(IOMP5_LIBRARY iomp5 libiomp5md HINTS ${INTEL_ROOT}/lib/intel64 ${INTEL_ROOT}/compiler/lib/intel64)
+    find_library(IOMP5_LIBRARY iomp5 libiomp5md HINTS
+      ${INTEL_ROOT}/lib ${INTEL_ROOT}/lib/intel64 ${INTEL_ROOT}/compiler/lib/intel64)
     if(IOMP5_LIBRARY)
       list(APPEND LIBRARIES ${IOMP5_LIBRARY})
       message(STATUS "Using OpenMP: ${IOMP5_LIBRARY}")
@@ -150,7 +191,7 @@ if(WITH_MKL)
   endif()
 
   # Find MKL libraries.
-  find_library(MKL_CORE_LIBRARY NAMES mkl_core PATHS ${MKL_ROOT}/lib/intel64)
+  find_library(MKL_CORE_LIBRARY NAMES mkl_core PATHS ${MKL_ROOT}/lib ${MKL_ROOT}/lib/intel64)
   if(MKL_CORE_LIBRARY)
     get_filename_component(MKL_LIBRARY_DIR ${MKL_CORE_LIBRARY} DIRECTORY)
     message(STATUS "Found MKL library directory: ${MKL_LIBRARY_DIR}")
@@ -158,7 +199,7 @@ if(WITH_MKL)
     message(FATAL_ERROR "MKL library directory not found")
   endif()
 
-  add_definitions(-DWITH_MKL -DMKL_ILP64)
+  add_definitions(-DCT2_WITH_MKL -DMKL_ILP64)
   if(WIN32)
     set(MKL_LIBRARIES
       ${MKL_LIBRARY_DIR}/mkl_core.lib
@@ -191,7 +232,7 @@ if(WITH_MKL)
       list(APPEND MKL_LIBRARIES ${MKL_LIBRARY_DIR}/libmkl_sequential.a)
     endif()
   endif()
-  list(APPEND INCLUDE_DIRECTORIES ${MKL_INCLUDE_DIR})
+  list(APPEND PRIVATE_INCLUDE_DIRECTORIES ${MKL_INCLUDE_DIR})
   if(WIN32 OR APPLE)
     list(APPEND LIBRARIES ${MKL_LIBRARIES})
   else()
@@ -199,9 +240,29 @@ if(WITH_MKL)
   endif()
 endif()
 
+if(WITH_DNNL)
+  find_path(DNNL_INCLUDE_DIR NAMES dnnl.h)
+  if(DNNL_INCLUDE_DIR)
+    message(STATUS "Found DNNL include directory: ${DNNL_INCLUDE_DIR}")
+  else()
+    message(FATAL_ERROR "DNNL include directory not found")
+  endif()
+
+  find_library(DNNL_LIBRARY NAMES dnnl)
+  if(DNNL_LIBRARY)
+    message(STATUS "Found DNNL library: ${DNNL_LIBRARY}")
+  else()
+    message(FATAL_ERROR "DNNL library not found")
+  endif()
+
+  add_definitions(-DCT2_WITH_DNNL)
+  list(APPEND PRIVATE_INCLUDE_DIRECTORIES ${DNNL_INCLUDE_DIR})
+  list(APPEND LIBRARIES ${DNNL_LIBRARY})
+endif()
+
 if (WITH_CUDA)
   find_package(CUDA 10.0 REQUIRED)
-  add_definitions(-DWITH_CUDA)
+  add_definitions(-DCT2_WITH_CUDA)
   if(MSVC)
     if(BUILD_SHARED_LIBS)
       set(CUDA_NVCC_FLAGS "${CUDA_NVCC_FLAGS} -Xcompiler=/MD$<$<CONFIG:Debug>:d>")
@@ -222,35 +283,34 @@ if (WITH_CUDA)
   cuda_select_nvcc_arch_flags(ARCH_FLAGS ${CUDA_ARCH_LIST})
   list(APPEND CUDA_NVCC_FLAGS ${ARCH_FLAGS})
 
-  find_library(CUDNN_LIBRARY cudnn
-    ${CUDA_TOOLKIT_ROOT_DIR}/lib64
-    ${CUDA_TOOLKIT_ROOT_DIR}/lib/x64
-    /usr/lib/x86_64-linux-gnu
-    )
-  if(CUDNN_LIBRARY)
-    message(STATUS "Found cuDNN library: ${CUDNN_LIBRARY}")
-  else()
-    message(FATAL_ERROR "cuDNN library not found")
-  endif()
+  if(WITH_TENSORRT)
+    find_library(TENSORRT_LIBRARY NAMES nvinfer)
+    find_path(TENSORRT_INCLUDE_DIR NAMES NvInfer.h)
+    if(NOT TENSORRT_LIBRARY OR NOT TENSORRT_INCLUDE_DIR)
+      message(FATAL_ERROR "TensorRT not found")
+    else()
+      message(STATUS "Found TensorRT library: ${TENSORRT_LIBRARY}")
+      message(STATUS "Found TensorRT include directory: ${TENSORRT_INCLUDE_DIR}")
+    endif()
 
-  find_library(TENSORRT_LIBRARY NAMES nvinfer)
-  find_path(TENSORRT_INCLUDE_DIR NAMES NvInfer.h)
-  if(NOT TENSORRT_LIBRARY OR NOT TENSORRT_INCLUDE_DIR)
-    message(FATAL_ERROR "TensorRT not found")
-  else()
-    message(STATUS "Found TensorRT library: ${TENSORRT_LIBRARY}")
-    message(STATUS "Found TensorRT include directory: ${TENSORRT_INCLUDE_DIR}")
-  endif()
+    if(NOT MSVC)
+      # TensorRT 6 header generates a lot of deprecating warnings. Ignore them.
+      set(CUDA_NVCC_FLAGS "${CUDA_NVCC_FLAGS} -Wno-deprecated-declarations")
+      set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-deprecated-declarations")
+    endif()
 
-  if(NOT MSVC)
-    # TensorRT 6 header generates a lot of deprecating warnings. Ignore them.
-    set(CUDA_NVCC_FLAGS "${CUDA_NVCC_FLAGS} -isystem ${TENSORRT_INCLUDE_DIR}")
-    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -isystem ${TENSORRT_INCLUDE_DIR}")
+    add_definitions(-DCT2_WITH_TENSORRT)
+    list(APPEND PRIVATE_INCLUDE_DIRECTORIES
+      ${TENSORRT_INCLUDE_DIR}
+      )
+    list(APPEND LIBRARIES
+      ${TENSORRT_LIBRARY}
+      )
   endif()
 
   message(STATUS "NVCC compilation flags: ${CUDA_NVCC_FLAGS}")
 
-  find_path(CUB_INCLUDE_DIR NAMES cub/cub.cuh PATHS ${CMAKE_SOURCE_DIR}/third_party/cub)
+  find_path(CUB_INCLUDE_DIR NAMES cub/cub.cuh PATHS ${CMAKE_CURRENT_SOURCE_DIR}/third_party/cub)
   if(NOT CUB_INCLUDE_DIR)
     message(FATAL_ERROR "CUB library not found")
   else()
@@ -259,16 +319,12 @@ if (WITH_CUDA)
 
   find_path(THRUST_INCLUDE_DIR
     NAMES thrust/device_vector.h
-    PATHS ${CMAKE_SOURCE_DIR}/third_party/thrust ${CUDA_TOOLKIT_ROOT_DIR}/include)
+    PATHS ${CMAKE_CURRENT_SOURCE_DIR}/third_party/thrust ${CUDA_TOOLKIT_ROOT_DIR}/include)
   if(NOT THRUST_INCLUDE_DIR)
     message(FATAL_ERROR "Thrust library not found")
   else()
     message(STATUS "Found Thrust include directory: ${THRUST_INCLUDE_DIR}")
   endif()
-
-  include_directories(
-    ${TENSORRT_INCLUDE_DIR}
-  )
 
   cuda_include_directories(
     ${CUB_INCLUDE_DIR}
@@ -279,23 +335,25 @@ if (WITH_CUDA)
     src/cuda/utils.cc
     src/primitives/cuda.cu
     src/ops/concat_split_gpu.cu
+    src/ops/dequantize_gpu.cu
     src/ops/gather_gpu.cu
     src/ops/layer_norm_gpu.cu
-    src/ops/multinomial_gpu.cu
     src/ops/softmax_gpu.cu
     src/ops/topk_gpu.cu
+    src/ops/quantize_gpu.cu
     )
   list(APPEND LIBRARIES
     ${CUDA_CUBLAS_LIBRARIES}
-    ${CUDNN_LIBRARY}
-    ${TENSORRT_LIBRARY}
     )
 else()
   add_library(${PROJECT_NAME} ${SOURCES})
 endif()
 
 target_link_libraries(${PROJECT_NAME} ${LIBRARIES})
-target_include_directories(${PROJECT_NAME} PUBLIC ${INCLUDE_DIRECTORIES})
+target_include_directories(${PROJECT_NAME}
+  PUBLIC ${PUBLIC_INCLUDE_DIRECTORIES}
+  PRIVATE ${PRIVATE_INCLUDE_DIRECTORIES}
+  )
 
 if(WITH_TESTS)
   add_subdirectory(tests)

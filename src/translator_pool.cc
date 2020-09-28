@@ -1,10 +1,14 @@
 #include "ctranslate2/translator_pool.h"
 
-#include <fstream>
-
 #include "ctranslate2/utils.h"
 
 namespace ctranslate2 {
+
+  TranslatorPool::TranslatorPool(size_t num_translators,
+                                 size_t num_threads_per_translator,
+                                 const std::shared_ptr<const models::Model>& model) {
+    create_translators(model, num_translators, num_threads_per_translator);
+  }
 
   TranslatorPool::~TranslatorPool() {
     {
@@ -27,36 +31,74 @@ namespace ctranslate2 {
                                                       const TranslationInput& target_prefix,
                                                       const TranslationOptions& options,
                                                       bool blocking) {
-    std::future<TranslationOutput> future;
-    TranslationJob job;
-    job.source = source;
-    job.target_prefix = target_prefix;
-    job.options = options;
+    std::unique_lock<std::mutex> lock(_mutex);
+    if (blocking)
+      _can_add_more_work.wait(lock, [this]{ return _work.size() < 2 * _workers.size(); });
 
-    {
-      std::unique_lock<std::mutex> lock(_mutex);
-      if (blocking)
-        _can_add_more_work.wait(lock, [this]{ return _work.size() < 2 * _workers.size(); });
+    // locked again here
 
-      // locked again here
+    _work.emplace(std::piecewise_construct,
+                  std::forward_as_tuple(source, target_prefix, options),
+                  std::forward_as_tuple());
 
-      _work.emplace(std::piecewise_construct,
-                    std::forward_as_tuple(std::move(job)),
-                    std::forward_as_tuple());
+    std::future<TranslationOutput> future = _work.back().second.get_future();
 
-      future = _work.back().second.get_future();
-
-      lock.unlock();
-    }
-
+    lock.unlock();
     _cv.notify_one();
     return future;
   }
 
-  void TranslatorPool::work_loop(Translator& translator, size_t intra_threads) {
+  void TranslatorPool::create_translators(const std::shared_ptr<const models::Model>& model,
+                                          size_t num_translators,
+                                          size_t num_threads_per_translator) {
+    if (model->device() == Device::CUDA) {
+      // On GPU, we currently don't benefit much from running translators in parallel, even
+      // when using separate streams. This could be revisited/improved in the future.
+      num_translators = 1;
+      // Most computation will run on GPU so multiple CPU computation threads are not useful.
+      num_threads_per_translator = 1;
+    }
+
+    static const int core_offset = read_int_from_env("CT2_TRANSLATORS_CORE_OFFSET", -1);
+    if (core_offset >= 0) {
+#ifdef __linux__
+      if (num_threads_per_translator > 1) {
+        throw std::invalid_argument("Pinning translators to CPU cores requires intra_threads = 1");
+      }
+#else
+      throw std::invalid_argument("Pinning translators to CPU cores is only supported on Linux");
+#endif
+    }
+
+    _translators.reserve(num_translators);
+    _workers.reserve(num_translators);
+    for (size_t i = 0; i < num_translators; ++i) {
+      _translators.emplace_back(model);
+      _workers.emplace_back(&TranslatorPool::work_loop,
+                            this,
+                            std::ref(_translators.back()),
+                            num_threads_per_translator);
+#ifdef __linux__
+      if (core_offset >= 0) {
+        cpu_set_t cpuset;
+        CPU_ZERO(&cpuset);
+        CPU_SET(core_offset + i, &cpuset);
+        const int status = pthread_setaffinity_np(_workers.back().native_handle(),
+                                                  sizeof (cpu_set_t),
+                                                  &cpuset);
+        if (status != 0) {
+          throw std::runtime_error("Error calling pthread_setaffinity_np: "
+                                   + std::to_string(status));
+        }
+      }
+#endif
+    }
+  }
+
+  void TranslatorPool::work_loop(Translator& translator, size_t num_threads) {
     // set_num_threads is called here because it sets the number of OpenMP threads for
     // the current thread.
-    set_num_threads(intra_threads);
+    set_num_threads(num_threads);
 
     while (true) {
       std::unique_lock<std::mutex> lock(_mutex);
@@ -73,61 +115,86 @@ namespace ctranslate2 {
 
       _can_add_more_work.notify_one();
 
-      auto& job = work_def.first;
+      const auto& job = work_def.first;
       auto& promise = work_def.second;
-      promise.set_value(translator.translate_batch_with_prefix(job.source,
-                                                               job.target_prefix,
-                                                               job.options));
+      try {
+        promise.set_value(translator.translate_batch_with_prefix(job.source,
+                                                                 job.target_prefix,
+                                                                 job.options));
+      } catch (...) {
+        try {
+          // Store the exception in the shared state so that future.get() will throw it.
+          promise.set_exception(std::current_exception());
+        } catch (...) {
+          // set_exception may throw too.
+        }
+      }
     }
   }
 
-  size_t TranslatorPool::consume_text_file(const std::string& in_file,
-                                           const std::string& out_file,
-                                           size_t max_batch_size,
-                                           const TranslationOptions& options,
-                                           bool with_scores) {
-    std::ifstream in(in_file);
-    if (!in.is_open())
-      throw std::runtime_error("failed to open input file " + in_file);
-    std::ofstream out(out_file);
-    if (!out.is_open())
-      throw std::runtime_error("failed to open output file " + out_file);
-    return consume_text_file(in, out, max_batch_size, options, with_scores);
+  void TranslatorPool::open_input_file(const std::string& file, std::ifstream& stream) const {
+    stream.open(file);
+    if (!stream)
+      throw std::runtime_error("failed to open input file " + file);
   }
 
-  size_t TranslatorPool::consume_text_file(std::istream& in,
-                                           std::ostream& out,
-                                           size_t max_batch_size,
-                                           const TranslationOptions& options,
-                                           bool with_scores) {
-    size_t num_tokens = 0;
+  void TranslatorPool::open_output_file(const std::string& file, std::ofstream& stream) const {
+    stream.open(file);
+    if (!stream)
+      throw std::runtime_error("failed to open output file " + file);
+  }
 
-    auto reader = [](std::istream& in, std::vector<std::string>& tokens) {
-      std::string line;
-      if (!std::getline(in, line))
-        return false;
-      tokens = split_string(line, ' ');
-      return true;
+  TranslationStats TranslatorPool::consume_text_file(const std::string& in_file,
+                                                     const std::string& out_file,
+                                                     size_t read_batch_size,
+                                                     const TranslationOptions& options,
+                                                     bool with_scores) {
+    std::ifstream in;
+    open_input_file(in_file, in);
+    std::ofstream out;
+    open_output_file(out_file, out);
+    return consume_text_file(in, out, read_batch_size, options, with_scores);
+  }
+
+  TranslationStats TranslatorPool::consume_text_file(std::istream& in,
+                                                     std::ostream& out,
+                                                     size_t read_batch_size,
+                                                     const TranslationOptions& options,
+                                                     bool with_scores) {
+    const auto tokenizer = [](const std::string& text) {
+      return split_string(text, ' ');
     };
 
-    auto writer = [&num_tokens, &with_scores](std::ostream& out, const TranslationResult& result) {
-      const auto& hypotheses = result.hypotheses();
-      const auto& scores = result.scores();
-      num_tokens += hypotheses[0].size();
-      for (size_t n = 0; n < hypotheses.size(); ++n) {
-        if (with_scores)
-          out << scores[n] << " ||| ";
-        for (size_t i = 0; i < hypotheses[n].size(); ++i) {
-          if (i > 0)
-            out << ' ';
-          out << hypotheses[n][i];
-        }
-        out << std::endl;
+    const auto detokenizer = [](const std::vector<std::string>& tokens) {
+      std::string text;
+      for (const auto& token : tokens) {
+        if (!text.empty())
+          text += ' ';
+        text += token;
       }
+      return text;
     };
 
-    consume_stream(in, out, max_batch_size, options, reader, writer);
-    return num_tokens;
+    return consume_raw_text_file(in,
+                                 out,
+                                 tokenizer,
+                                 detokenizer,
+                                 read_batch_size,
+                                 options,
+                                 with_scores);
+  }
+
+  size_t TranslatorPool::num_queued_batches() {
+    const std::lock_guard<std::mutex> lock(_mutex);
+    return _work.size();
+  }
+
+  size_t TranslatorPool::num_translators() const {
+    return _translators.size();
+  }
+
+  const std::vector<Translator>& TranslatorPool::get_translators() const {
+    return _translators;
   }
 
 }

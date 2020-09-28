@@ -4,6 +4,194 @@
 
 ### Fixes and improvements
 
+* Fix CUDA illegal memory access when changing the beam size in the same process
+
+## [v1.13.2](https://github.com/OpenNMT/CTranslate2/releases/tag/v1.13.2) (2020-08-31)
+
+### Fixes and improvements
+
+* Fix model conversion to `float16` when using the Python converters: weights were duplicated and not correctly converted
+* Fix incorrect code logic that could lead to incorrect translation results
+
+## [v1.13.1](https://github.com/OpenNMT/CTranslate2/releases/tag/v1.13.1) (2020-08-06)
+
+### Fixes and improvements
+
+* Fix performance regression when decoding with a large beam size on GPU
+
+## [v1.13.0](https://github.com/OpenNMT/CTranslate2/releases/tag/v1.13.0) (2020-07-30)
+
+### New features
+
+* Environment variable `CT2_TRANSLATORS_CORE_OFFSET` to pin parallel translators to a range of CPU cores (only for `intra_threads` = 1)
+* [Python] Add some properties to the `Translator` object:
+  * `device`
+  * `device_index`
+  * `num_translators`
+  * `num_queued_batches`
+  * `model_is_loaded`
+
+### Fixes and improvements
+
+* Improve batch performance of target prefix
+* Improve performance when the input batch contains sentences with very different lengths
+* Improve beam search performance by expanding the batch size only after the first decoding step
+* Optimize Transpose op on GPU for the permutation used in multi-head attention
+* Remove padding in returned attention vectors
+* Update Intel MKL to 2020.2
+
+## [v1.12.1](https://github.com/OpenNMT/CTranslate2/releases/tag/v1.12.1) (2020-07-20)
+
+### Fixes and improvements
+
+* Fix implicit int16 to float16 model conversion on compatible GPUs
+
+## [v1.12.0](https://github.com/OpenNMT/CTranslate2/releases/tag/v1.12.0) (2020-07-16)
+
+### Changes
+
+* Docker images based on Ubuntu 16.04 are no longer updated
+
+### New features
+
+* Support `float16` data type for model conversion (with `--quantization float16`) and computation (with `--compute_type float16`). FP16 execution can improve performance by up to 50% on NVIDIA GPUs with Compute Capability >= 7.0.
+* Add Docker images with newer CUDA versions, which can improve performance in some cases:
+  * `latest-ubuntu18-cuda10.0` (same as `latest-ubuntu18-gpu`)
+  * `latest-ubuntu18-cuda10.1`
+  * `latest-ubuntu18-cuda10.2`
+  * `latest-centos7-cuda10.0` (same as `latest-centos7-gpu`)
+  * `latest-centos7-cuda10.1`
+  * `latest-centos7-cuda10.2`
+* Allow setting a computation type per device (e.g. `Translator(..., compute_type={"cuda": "float16", "cpu": "int8"})` with the Python API)
+* [C++] Add `ModelReader` interface to customize model loading
+
+### Fixes and improvements
+
+* Optimize Transpose op on CPU for the permutation used in multi-head attention
+* Optimize GELU op CPU with Intel MKL
+* Fix compilation when targeting an architecture and disabling ISA dispatch (e.g.: `-DCMAKE_CXX_FLAGS="-march=skylake" -DENABLE_CPU_DISPATCH=OFF`)
+* Inline some frequently called methods
+
+## [v1.11.0](https://github.com/OpenNMT/CTranslate2/releases/tag/v1.11.0) (2020-06-29)
+
+### New features
+
+* Add tokenization and detokenization hooks for file translation APIs
+* Add alternatives to Intel MKL:
+  * Integrate [oneDNN](https://github.com/oneapi-src/oneDNN) for GEMM functions
+  * Implement vectorized operators that automatically select the instruction set architecture (ISA) (can be manually controlled with the `CT2_FORCE_CPU_ISA` environment variable)
+* When alternatives are available, avoid using Intel MKL on non Intel processors (can be manually controlled with the `CT2_USE_MKL` environment variable)
+* Enable a verbose mode with the environment variable `CT2_VERBOSE=1` to help debugging the run configuration (e.g. the detected CPU, whether Intel MKL is being used, etc.)
+
+### Fixes and improvements
+
+* Improve numerical precision of SoftMax and LogSoftMax layers on CPU
+* Parallelize INT16 quantization/dequantization and ReLU on CPU
+* Add back the translation client in CentOS 7 Docker images
+
+## [v1.10.2](https://github.com/OpenNMT/CTranslate2/releases/tag/v1.10.2) (2020-06-23)
+
+### Fixes and improvements
+
+* [Python] Fix error when calling `unload_model(to_cpu=True)` for models with shared weights
+* [Python] Do not ignore errors when importing the compiled translator extension
+
+## [v1.10.1](https://github.com/OpenNMT/CTranslate2/releases/tag/v1.10.1) (2020-05-25)
+
+### Fixes and improvements
+
+* Force `intra_threads` to 1 when running a model on GPU to prevent high CPU load
+* Improve handling of decoding length constraints when using a target prefix
+* Do not raise an error when setting `use_vmap` but no vocabulary map exists
+
+## [v1.10.0](https://github.com/OpenNMT/CTranslate2/releases/tag/v1.10.0) (2020-04-17)
+
+### New features
+
+* Coverage penalty as in [Wu et al. 2016](https://arxiv.org/abs/1609.08144) with the option `coverage_penalty`
+* Batch size can be expressed in number of tokens with the option `batch_type`
+* Translation scores can be disabled with the option `return_scores` (if disabled, the final SoftMax is skipped during greedy decoding)
+* Support compilation without TensorRT by setting `-DWITH_TENSORRT=OFF` during CMake configuration (in this case, beam search is no longer supported)
+* Experimental integration of [Intel MKL's packed GEMM](https://software.intel.com/en-us/articles/introducing-the-new-packed-apis-for-gemm) which can be enabled by setting the environment variable `CT2_USE_EXPERIMENTAL_PACKED_GEMM=1`
+
+### Fixes and improvements
+
+* Remove direct dependency to cuDNN (still an indirect dependency via TensorRT)
+* Static AVX optimization for the ReLU operator
+* Remove unnecessary memory initialization when creating temporary buffers
+* Dissociate SoftMax and LogSoftMax in profiling report
+
+## [v1.9.1](https://github.com/OpenNMT/CTranslate2/releases/tag/v1.9.1) (2020-04-08)
+
+### Fixes and improvements
+
+* Fix parallel translations when calling `Translator.translate_batch` from multiple Python threads
+* Fix crash on invalid `num_hypotheses` value
+
+## [v1.9.0](https://github.com/OpenNMT/CTranslate2/releases/tag/v1.9.0) (2020-03-24)
+
+### New features
+
+* Return 2 additional statistics from file translation APIs:
+  * the number of translated examples
+  * the total translation time in milliseconds
+
+### Fixes and improvements
+
+* Fix exceptions that were not catched by the Python wrapper
+* Fix an invalid insertion in the variables collection while iterating over it
+* Optimize filling operation of float storages
+* Internal refactoring of decoding functions to make them reusable for other tasks (e.g. generative language models)
+
+## [v1.8.0](https://github.com/OpenNMT/CTranslate2/releases/tag/v1.8.0) (2020-03-10)
+
+### New features
+
+* [Python] Add methods `Translator.unload_model` and `Translator.load_model` to manually manage memory
+* [Docker] Move all images to Python 3 only
+* Expose options that enable an internal sorting by length to increase the translation efficiency:
+  * for file translation: `read_batch_size` contiguous examples will be loaded, sorted by length, and batched with size `max_batch_size`
+  * for batch translation: if the batch is larger than `max_batch_size`, examples will be sorted by length and batched with size `max_batch_size`
+
+### Fixes and improvements
+
+* Fix another error when releasing a translator that is placed on a GPU that is not GPU 0
+* Fix possible memory corruption when creating GPU translators in parallel
+* Fix memory that is briefly allocated on GPU 0 when destroying a translator that is placed on another GPU
+* Reduce latency of model loading, especially on GPU
+
+## [v1.7.1](https://github.com/OpenNMT/CTranslate2/releases/tag/v1.7.1) (2020-03-03)
+
+### Fixes and improvements
+
+* Revert "Parallelize some low level transformations on CPU" which caused incorrect computation
+* Avoid unnecessary TensorFlow runtime initialization when converting checkpoints
+* Fix compilation without MKL
+
+## [v1.7.0](https://github.com/OpenNMT/CTranslate2/releases/tag/v1.7.0) (2020-02-28)
+
+### New features
+
+* Translation option `return_alternatives` to return multiple choices at the first unconstrained decoding position: combined with a target prefix, this could be used to provide alternative words and translations at a specific location in the target
+* Support Transformers with different number of encoder/decoder layers
+* Allow compilation without OpenMP with `-DOPENMP_RUNTIME=NONE`
+
+### Fixes and improvements
+
+* Fix SavedModel conversion when TensorFlow Addons 0.8 is installed
+* Fix error when releasing a translator/model that is placed on a GPU that is not GPU 0
+* Fix memory that was allocated on GPU 0 even when the translator/model was placed on another GPU
+* Query GPU int8 support on the first model load, and then cache the result for future loads
+* Avoid creating an empty model directory on conversion errors
+* Parallelize some low level transformations on CPU
+* Reduce memory usage when translating large files by limiting the work queue size
+
+## [v1.6.3](https://github.com/OpenNMT/CTranslate2/releases/tag/v1.6.3) (2020-02-24)
+
+### Fixes and improvements
+
+* Fix incorrectness in relative representation computation
+
 ## [v1.6.2](https://github.com/OpenNMT/CTranslate2/releases/tag/v1.6.2) (2020-02-21)
 
 ### Fixes and improvements

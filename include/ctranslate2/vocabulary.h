@@ -1,12 +1,13 @@
 #pragma once
 
+#include <istream>
 #include <string>
 #include <unordered_map>
 #include <vector>
 
 namespace ctranslate2 {
 
-  // Implements an standard indexed vocabulary
+  // Implements a standard indexed vocabulary.
   class Vocabulary
   {
   public:
@@ -15,14 +16,14 @@ namespace ctranslate2 {
     static const std::string bos_token;
     static const std::string eos_token;
 
-    Vocabulary(const std::string& path);
+    Vocabulary(std::istream& in);
 
     const std::string& to_token(size_t id) const;
     size_t to_id(const std::string& token) const;
     size_t size() const;
 
   private:
-    std::vector<std::string> _id_to_token;
+    std::vector<const std::string*> _id_to_token;
     std::unordered_map<std::string, size_t> _token_to_id;
   };
 

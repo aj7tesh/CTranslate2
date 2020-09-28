@@ -13,8 +13,8 @@ namespace ctranslate2 {
     static void set_device(int index);
     static int get_device();
 
-    static void* alloc_data(dim_t size);
-    static void free_data(void* data);
+    static void* alloc_data(dim_t size, int device_index = -1);
+    static void free_data(void* data, int device_index = -1);
     static void clear_cache();
 
     template <typename T>
@@ -27,6 +27,8 @@ namespace ctranslate2 {
 
     template <typename T>
     static void copy(const T* x, T* y, dim_t size);
+    template <typename U, typename V>
+    static void convert(const U* x, V* y, dim_t size);
 
     template <typename T>
     static T sum(const T* array, dim_t size);
@@ -43,6 +45,12 @@ namespace ctranslate2 {
     static T max(const T* array, dim_t size);
     template <typename T>
     static T amax(const T* array, dim_t size);
+    template <typename T>
+    static void row_max(const T* x,
+                        const dim_t rows,
+                        const dim_t cols,
+                        T* values,
+                        int32_t* indices);
 
     template <typename T>
     static void add(T a, const T* x, T* y, dim_t size);
@@ -91,6 +99,28 @@ namespace ctranslate2 {
     static void sub(const T* a, const T* b, T* c, dim_t size);
 
     template <typename T>
+    static void max(T a, const T* x, T* y, dim_t size);
+
+    template <typename T>
+    static void max(const T* a, const T* b, T* c, dim_t size);
+
+    template <typename T>
+    static void max(T a, T* y, dim_t size) {
+      max(a, y, y, size);
+    }
+
+    template <typename T>
+    static void min(T a, const T* x, T* y, dim_t size);
+
+    template <typename T>
+    static void min(const T* a, const T* b, T* c, dim_t size);
+
+    template <typename T>
+    static void min(T a, T* y, dim_t size) {
+      min(a, y, y, size);
+    }
+
+    template <typename T>
     static void mul(T a, const T* x, T* y, dim_t size);
 
     template <typename T>
@@ -115,43 +145,20 @@ namespace ctranslate2 {
     }
 
     template <typename T>
-    static void inv(const T* x, T* y, dim_t size);
-
-    template <typename T>
-    static void quantize(const float* x, T* y, dim_t size, float scale, float shift = 0);
-
-    template <typename T>
-    static void dequantize(const T* x, float* y, dim_t size, float scale, float shift = 0);
-
-    static void quantize_batch(const float* x, float* scales, int8_t* qx,
-                               dim_t batch_size, dim_t depth, float shift = 0);
-
-    template <typename T>
-    static void dequantize_batch(const T* x, const float* scale, float* y,
-                                 dim_t x_size, dim_t scale_size, float shift = 0);
-
-    static void rescale_output(const int32_t* x,
-                               const float* input_scales,
-                               const float* weigh_scales,
-                               float* y,
-                               dim_t batch_size,
-                               dim_t depth);
-
-    template <typename T>
     static void transpose_2d(const T* a, const dim_t* dims, T* b);
     template <typename T>
     static void transpose_3d(const T* a, const dim_t* dims, const dim_t* perm, T* b);
     template <typename T>
     static void transpose_4d(const T* a, const dim_t* dims, const dim_t* perm, T* b);
 
-    static void pow(const float* x, float* y, float power, dim_t size);
     static void exp(const float* x, float* y, dim_t size);
     static void log(const float* x, float* y, dim_t size);
     static void cos(const float* x, float* y, dim_t size);
     static void sin(const float* x, float* y, dim_t size);
-    static void tanh(const float* x, float* y, dim_t size);
-    static void relu(const float* x, float* y, dim_t size);
     static void gelu(const float* x, float* y, dim_t size);
+
+    template <typename T>
+    static void relu(const T* x, T* y, dim_t size);
 
     static void compute_u8_compensation(const int8_t* b,
                                         bool transpose_b,
@@ -159,10 +166,20 @@ namespace ctranslate2 {
                                         dim_t n,
                                         float alpha,
                                         int32_t* compensation);
-    static bool prefer_u8s8s32_gemm();
+
+    // If dest is not passed, returns the number of bytes required to store the packed data,
+    // or 0 if packing is not supported.
+    template <typename T>
+    static dim_t gemm_pack_b(const T* b,
+                             const bool transpose_b,
+                             const dim_t k,
+                             const dim_t n,
+                             const float alpha,
+                             T* dest = nullptr);
 
     template <typename In, typename Out>
     static void gemm(const In* a, const In* b,
+                     bool a_is_packed, bool b_is_packed,
                      bool transpose_a, bool transpose_b,
                      dim_t m, dim_t n, dim_t k,
                      float alpha, float beta,

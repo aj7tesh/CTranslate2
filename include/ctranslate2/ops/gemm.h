@@ -7,10 +7,13 @@ namespace ctranslate2 {
 
     class Gemm : public Op {
     public:
-      Gemm(float alpha = 1, float beta = 1, bool trans_a = false, bool trans_b = false);
+      Gemm(float alpha = 1,
+           float beta = 1,
+           bool trans_a = false,
+           bool trans_b = false,
+           bool a_is_packed = false,
+           bool b_is_packed = false);
 
-      void operator()(const std::vector<StorageView*>& inputs,
-                      std::vector<StorageView*>& outputs) const override;
       void operator()(const StorageView& a,
                       const StorageView& b,
                       StorageView& c,
@@ -31,6 +34,8 @@ namespace ctranslate2 {
       float _beta;
       bool _trans_a;
       bool _trans_b;
+      bool _a_is_packed;
+      bool _b_is_packed;
     };
 
   }

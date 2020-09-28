@@ -1,4 +1,3 @@
-#include <chrono>
 #include <fstream>
 #include <iostream>
 
@@ -12,46 +11,56 @@
 int main(int argc, char* argv[]) {
   cxxopts::Options cmd_options("translate", "CTranslate2 translation client");
   cmd_options.add_options()
-    ("help", "Display available options.")
+    ("h,help", "Display available options.")
     ("model", "Path to the CTranslate2 model directory.", cxxopts::value<std::string>())
-    ("compute_type", "Force the model type as \"float\", \"int16\" or \"int8\"",
-        cxxopts::value<std::string>()->default_value("default"))
-        ("src", "Path to the file to translate (read from the standard input if not set).",
-        cxxopts::value<std::string>())
+    ("compute_type", "The type used for computation: default, float, float16, int16, or int8",
+     cxxopts::value<std::string>()->default_value("default"))
+    ("cuda_compute_type", "Computation type on CUDA devices (overrides compute_type)",
+     cxxopts::value<std::string>())
+    ("cpu_compute_type", "Computation type on CPU devices (overrides compute_type)",
+     cxxopts::value<std::string>())
+    ("src", "Path to the file to translate (read from the standard input if not set).",
+     cxxopts::value<std::string>())
     ("tgt", "Path to the output file (write to the standard output if not set.",
-        cxxopts::value<std::string>())
+     cxxopts::value<std::string>())
     ("use_vmap", "Use the vocabulary map included in the model to restrict the target candidates.",
-        cxxopts::value<bool>()->default_value("false"))
-    ("batch_size", "Number of sentences to forward into the model at once.",
-        cxxopts::value<size_t>()->default_value("30"))
+     cxxopts::value<bool>()->default_value("false"))
+    ("batch_size", "Size of the batch to forward into the model at once.",
+     cxxopts::value<size_t>()->default_value("30"))
+    ("read_batch_size", "Size of the batch to read at once (defaults to batch_size).",
+     cxxopts::value<size_t>()->default_value("0"))
+    ("batch_type", "Batch type (can be examples, tokens).",
+     cxxopts::value<std::string>()->default_value("examples"))
     ("beam_size", "Beam search size (set 1 for greedy decoding).",
-        cxxopts::value<size_t>()->default_value("5"))
+     cxxopts::value<size_t>()->default_value("5"))
     ("sampling_topk", "Sample randomly from the top K candidates.",
-        cxxopts::value<size_t>()->default_value("1"))
+     cxxopts::value<size_t>()->default_value("1"))
     ("sampling_temperature", "Sampling temperature.",
-        cxxopts::value<float>()->default_value("1"))
-     ("n_best", "Also output the n-best hypotheses.",
-         cxxopts::value<size_t>()->default_value("1"))
+     cxxopts::value<float>()->default_value("1"))
+    ("n_best", "Also output the n-best hypotheses.",
+     cxxopts::value<size_t>()->default_value("1"))
     ("with_score", "Also output translation scores.",
-        cxxopts::value<bool>()->default_value("false"))
+     cxxopts::value<bool>()->default_value("false"))
     ("length_penalty", "Length penalty to apply during beam search",
-        cxxopts::value<float>()->default_value("0"))
+     cxxopts::value<float>()->default_value("0"))
+    ("coverage_penalty", "Coverage penalty to apply during beam search",
+     cxxopts::value<float>()->default_value("0"))
     ("max_sent_length", "Maximum sentence length to produce.",
-        cxxopts::value<size_t>()->default_value("250"))
+     cxxopts::value<size_t>()->default_value("250"))
     ("min_sent_length", "Minimum sentence length to produce.",
-        cxxopts::value<size_t>()->default_value("1"))
+     cxxopts::value<size_t>()->default_value("1"))
     ("log_throughput", "Log average tokens per second at the end of the translation.",
-        cxxopts::value<bool>()->default_value("false"))
+     cxxopts::value<bool>()->default_value("false"))
     ("log_profiling", "Log execution profiling.",
-        cxxopts::value<bool>()->default_value("false"))
+     cxxopts::value<bool>()->default_value("false"))
     ("inter_threads", "Maximum number of translations to run in parallel.",
-        cxxopts::value<size_t>()->default_value("1"))
+     cxxopts::value<size_t>()->default_value("1"))
     ("intra_threads", "Number of OpenMP threads (set to 0 to use the default value).",
-        cxxopts::value<size_t>()->default_value("0"))
+     cxxopts::value<size_t>()->default_value("0"))
     ("device", "Device to use (can be cpu, cuda, auto).",
-        cxxopts::value<std::string>()->default_value("cpu"))
+     cxxopts::value<std::string>()->default_value("cpu"))
     ("device_index", "Index of the device to use.",
-        cxxopts::value<int>()->default_value("0"))
+     cxxopts::value<int>()->default_value("0"))
     ;
 
   auto args = cmd_options.parse(argc, argv);
@@ -68,23 +77,43 @@ int main(int argc, char* argv[]) {
   size_t inter_threads = args["inter_threads"].as<size_t>();
   size_t intra_threads = args["intra_threads"].as<size_t>();
 
+  // The same number of OpenMP threads should be used for loading and running model.
+  ctranslate2::set_num_threads(intra_threads);
+
+  const auto device = ctranslate2::str_to_device(args["device"].as<std::string>());
+  auto compute_type = ctranslate2::str_to_compute_type(args["compute_type"].as<std::string>());
+  switch (device) {
+  case ctranslate2::Device::CPU:
+    if (args.count("cpu_compute_type"))
+      compute_type = ctranslate2::str_to_compute_type(args["cpu_compute_type"].as<std::string>());
+    break;
+  case ctranslate2::Device::CUDA:
+    if (args.count("cuda_compute_type"))
+      compute_type = ctranslate2::str_to_compute_type(args["cuda_compute_type"].as<std::string>());
+    break;
+  };
+
   auto model = ctranslate2::models::Model::load(
     args["model"].as<std::string>(),
-    args["device"].as<std::string>(),
+    device,
     args["device_index"].as<int>(),
-    args["compute_type"].as<std::string>());
+    compute_type);
 
   ctranslate2::TranslatorPool translator_pool(inter_threads, intra_threads, model);
 
   auto options = ctranslate2::TranslationOptions();
+  options.max_batch_size = args["batch_size"].as<size_t>();
+  options.batch_type = ctranslate2::str_to_batch_type(args["batch_type"].as<std::string>());
   options.beam_size = args["beam_size"].as<size_t>();
   options.length_penalty = args["length_penalty"].as<float>();
+  options.coverage_penalty = args["coverage_penalty"].as<float>();
   options.sampling_topk = args["sampling_topk"].as<size_t>();
   options.sampling_temperature = args["sampling_temperature"].as<float>();
   options.max_decoding_length = args["max_sent_length"].as<size_t>();
   options.min_decoding_length = args["min_sent_length"].as<size_t>();
   options.num_hypotheses = args["n_best"].as<size_t>();
   options.use_vmap = args["use_vmap"].as<bool>();
+  options.return_scores = args["with_score"].as<bool>();
 
   std::istream* in = &std::cin;
   std::ostream* out = &std::cout;
@@ -100,17 +129,19 @@ int main(int argc, char* argv[]) {
   }
 
   auto log_profiling = args["log_profiling"].as<bool>();
-  auto t1 = std::chrono::high_resolution_clock::now();
   if (log_profiling)
     ctranslate2::init_profiling(model->device(), inter_threads);
-  auto num_tokens = translator_pool.consume_text_file(*in,
-                                                      *out,
-                                                      args["batch_size"].as<size_t>(),
-                                                      options,
-                                                      args["with_score"].as<bool>());
+  auto read_batch_size = args["read_batch_size"].as<size_t>();
+  if (read_batch_size == 0)
+    read_batch_size = options.max_batch_size;
+  const ctranslate2::TranslationStats stats = translator_pool.consume_text_file(
+    *in,
+    *out,
+    read_batch_size,
+    options,
+    args["with_score"].as<bool>());
   if (log_profiling)
     ctranslate2::dump_profiling(std::cerr);
-  auto t2 = std::chrono::high_resolution_clock::now();
 
   if (in != &std::cin)
     delete in;
@@ -118,8 +149,7 @@ int main(int argc, char* argv[]) {
     delete out;
 
   if (args["log_throughput"].as<bool>()) {
-    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(t2 - t1).count();
-    std::cerr << static_cast<double>(num_tokens) / static_cast<double>(duration / 1000) << std::endl;
+    std::cerr << static_cast<double>(stats.num_tokens) / (stats.total_time_in_ms / 1000) << std::endl;
   }
 
   return 0;

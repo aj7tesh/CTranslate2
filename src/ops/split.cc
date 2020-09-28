@@ -2,7 +2,8 @@
 
 #include <numeric>
 
-#include "../device_dispatch.h"
+#include "device_dispatch.h"
+#include "type_dispatch.h"
 
 namespace ctranslate2 {
   namespace ops {
@@ -20,11 +21,6 @@ namespace ctranslate2 {
       , _total_size(std::accumulate(split.begin(), split.end(), 0))
       , _no_copy(no_copy) {
       check_arguments();
-    }
-
-    void Split::operator()(const std::vector<StorageView*>& inputs,
-                           std::vector<StorageView*>& outputs) const {
-      operator()(*inputs[0], outputs);
     }
 
     void Split::operator()(const StorageView& input,

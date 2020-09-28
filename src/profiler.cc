@@ -1,5 +1,23 @@
 #include "ctranslate2/profiler.h"
 
+#ifndef CT2_ENABLE_PROFILING
+
+#include <stdexcept>
+
+namespace ctranslate2 {
+
+  void init_profiling(Device, size_t) {
+    throw std::runtime_error("CTranslate2 was not compiled with profiling support, "
+                             "enable it with -DENABLE_PROFILING=ON during cmake configuration.");
+  }
+
+  void dump_profiling(std::ostream&) {
+  }
+
+}
+
+#else
+
 #include <algorithm>
 #include <iomanip>
 #include <memory>
@@ -7,7 +25,7 @@
 #include <vector>
 #include <unordered_map>
 
-#ifdef WITH_CUDA
+#ifdef CT2_WITH_CUDA
 #  include <cuda_runtime.h>
 #endif
 
@@ -115,12 +133,7 @@ namespace ctranslate2 {
 
 
   void init_profiling(Device device, size_t num_threads) {
-#ifdef ENABLE_PROFILING
     profiler.reset(new Profiler(device, num_threads));
-#else
-    throw std::runtime_error("CTranslate2 was not compiled with profiling support, "
-                             "enable it with -DENABLE_PROFILING=ON during cmake configuration.");
-#endif
   }
 
   void dump_profiling(std::ostream& os) {
@@ -146,7 +159,7 @@ namespace ctranslate2 {
   ScopeProfiler::~ScopeProfiler() {
     if (!profiler)
       return;
-#ifdef WITH_CUDA
+#ifdef CT2_WITH_CUDA
     if (profiler->device() == Device::CUDA)
       cudaDeviceSynchronize();
 #endif
@@ -157,3 +170,5 @@ namespace ctranslate2 {
   }
 
 }
+
+#endif

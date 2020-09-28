@@ -34,15 +34,32 @@ def test_contains_model(tmpdir):
     model_dir.ensure(dir=1)
     assert not ctranslate2.contains_model(str(model_dir))
     model_dir.join("model.bin").ensure(file=1)
-    assert not ctranslate2.contains_model(str(model_dir))
-    model_dir.join("shared_vocabulary.txt").ensure(file=1)
     assert ctranslate2.contains_model(str(model_dir))
 
-def test_batch_translation():
+def test_translator_properties():
+    translator = ctranslate2.Translator(_get_model_path(), inter_threads=2)
+    assert translator.model_is_loaded
+    assert translator.device == "cpu"
+    assert translator.device_index == 0
+    assert translator.num_translators == 2
+    assert translator.num_queued_batches == 0
+
+def test_compute_type():
+    model_path = _get_model_path()
+    with pytest.raises(ValueError):
+        ctranslate2.Translator(model_path, compute_type="float64")
+    with pytest.raises(ValueError):
+        ctranslate2.Translator(model_path, compute_type=["int8", "int16"])
+    ctranslate2.Translator(model_path, compute_type="int8")
+    ctranslate2.Translator(model_path, compute_type={"cuda": "float16", "cpu": "int8"})
+
+@pytest.mark.parametrize("max_batch_size", [0, 1])
+def test_batch_translation(max_batch_size):
     translator = _get_transliterator()
     output = translator.translate_batch([
         ["آ" ,"ت" ,"ز" ,"م" ,"و" ,"ن"],
-        ["آ" ,"ت" ,"ش" ,"ي" ,"س" ,"و" ,"ن"]])
+        ["آ" ,"ت" ,"ش" ,"ي" ,"س" ,"و" ,"ن"]],
+        max_batch_size=max_batch_size)
     assert len(output) == 2
     assert len(output[0]) == 1  # One hypothesis.
     assert len(output[1]) == 1
@@ -66,11 +83,54 @@ def test_file_translation(tmpdir):
         assert lines[0].strip() == "a t z m o n"
         assert lines[1].strip() == "a c h i s o n"
     assert stats[0] == 13  # Number of generated target tokens.
+    assert stats[1] == 2  # Number of translated examples.
+    assert isinstance(stats[2], float)  # Total time in milliseconds.
+
+def test_raw_file_translation(tmpdir):
+    input_path = str(tmpdir.join("input.txt"))
+    output_path = str(tmpdir.join("output.txt"))
+    with open(input_path, "w") as input_file:
+        input_file.write("آتزمون")
+        input_file.write("\n")
+        input_file.write("آتشيسون")
+        input_file.write("\n")
+
+    translator = ctranslate2.Translator(_get_model_path())
+    tokenize_fn = lambda text: list(text)
+    detokenize_fn = lambda tokens: "".join(tokens)
+    max_batch_size = 4
+
+    with pytest.raises(ValueError):
+        translator.translate_file(
+            input_path, output_path, max_batch_size, tokenize_fn=tokenize_fn)
+    with pytest.raises(ValueError):
+        translator.translate_file(
+            input_path, output_path, max_batch_size, detokenize_fn=detokenize_fn)
+
+    translator.translate_file(
+        input_path,
+        output_path,
+        max_batch_size,
+        tokenize_fn=tokenize_fn,
+        detokenize_fn=detokenize_fn)
+
+    with open(output_path) as output_file:
+        lines = output_file.readlines()
+        assert lines[0].strip() == "atzmon"
+        assert lines[1].strip() == "achison"
 
 def test_empty_translation():
     translator = _get_transliterator()
     assert translator.translate_batch([]) == []
     assert translator.translate_batch(None) == []
+
+def test_invalid_translation_options():
+    translator = _get_transliterator()
+    with pytest.raises(ValueError):
+        translator.translate_batch(
+            [["آ" ,"ت" ,"ز" ,"م" ,"و" ,"ن"]],
+            min_decoding_length=10,
+            max_decoding_length=5)
 
 def test_target_prefix():
     translator = _get_transliterator()
@@ -103,6 +163,37 @@ def test_return_attention():
     assert len(attention) == 6  # Target length.
     assert len(attention[0]) == 6  # Source length.
 
+def test_ignore_scores():
+    translator = _get_transliterator()
+    output = translator.translate_batch(
+        [["آ" ,"ت" ,"ز" ,"م" ,"و" ,"ن"]],
+        beam_size=1,
+        return_scores=False)
+    assert "scores" not in output[0][0]
+
+def test_return_alternatives():
+    translator = _get_transliterator()
+    output = translator.translate_batch(
+        [["آ" ,"ت" ,"ز" ,"م" ,"و" ,"ن"]],
+        target_prefix=[["a", "t"]],
+        num_hypotheses=10,
+        return_alternatives=True)
+    assert len(output[0]) == 10
+    assert output[0][0]["tokens"] == ["a", "t", "z", "m", "o", "n"]
+    assert output[0][1]["tokens"] == ["a", "t", "s", "u", "m", "o", "n"]
+
+@pytest.mark.parametrize("to_cpu", [False, True])
+def test_model_unload(to_cpu):
+    batch = [["آ" ,"ت" ,"ز" ,"م" ,"و" ,"ن"]]
+    translator = _get_transliterator()
+    translator.unload_model(to_cpu=to_cpu)
+    with pytest.raises(RuntimeError, match="unloaded"):
+        translator.translate_batch(batch)
+    translator.load_model()
+    output = translator.translate_batch(batch)
+    assert len(output) == 1
+    assert output[0][0]["tokens"] == ["a", "t", "z", "m", "o", "n"]
+
 
 _FRAMEWORK_DATA_EXIST = os.path.isdir(
     os.path.join(_TEST_DATA_DIR, "models", "transliteration-aren-all"))
@@ -131,7 +222,7 @@ def test_opennmt_tf_model_conversion(tmpdir, model_path, src_vocab, tgt_vocab, m
     assert output[0][0]["tokens"] == ["a", "t", "z", "m", "o", "n"]
 
 @pytest.mark.skipif(not _FRAMEWORK_DATA_EXIST, reason="Data files are not available")
-@pytest.mark.parametrize("quantization", ["int16", "int8"])
+@pytest.mark.parametrize("quantization", ["float16", "int16", "int8"])
 def test_opennmt_tf_model_quantization(tmpdir, quantization):
     model_path = os.path.join(
         _TEST_DATA_DIR, "models", "transliteration-aren-all", "opennmt_tf", "v2", "checkpoint")
@@ -263,20 +354,36 @@ def test_layer_spec_validate():
 
 def test_layer_spec_optimize():
 
+    class SubSpec(ctranslate2.specs.LayerSpec):
+        def __init__(self):
+            self.a = np.ones([6], dtype=np.float32)
+
     class Spec(ctranslate2.specs.LayerSpec):
         def __init__(self):
             self.a = np.ones([5], dtype=np.float32)
             self.b = np.ones([5], dtype=np.float32)
             self.c = np.zeros([5], dtype=np.int32)
+            self.d = np.dtype("float32").type(3.14)
             self.weight = np.ones([5, 4], dtype=np.float32)
+            self.sub = SubSpec()
 
     spec = Spec()
     spec.optimize(quantization="int16")
     assert spec.a.dtype == np.float32
     assert spec.b == "a"
     assert spec.c.dtype == np.int32
+    assert spec.d.dtype == np.float32
     assert spec.weight.dtype == np.int16
     assert spec.weight_scale.dtype == np.float32
+
+    spec = Spec()
+    spec.optimize(quantization="float16")
+    assert spec.a.dtype == np.float16
+    assert spec.b == "a"
+    assert spec.c.dtype == np.int32
+    assert spec.d.dtype == np.float32
+    assert spec.weight.dtype == np.float16
+    assert spec.sub.a.dtype == np.float16
 
 def test_index_spec():
     spec = ctranslate2.specs.TransformerBase()

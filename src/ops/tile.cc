@@ -1,6 +1,7 @@
 #include "ctranslate2/ops/tile.h"
 
-#include "../device_dispatch.h"
+#include "device_dispatch.h"
+#include "type_dispatch.h"
 
 namespace ctranslate2 {
   namespace ops {
@@ -11,6 +12,11 @@ namespace ctranslate2 {
       PROFILE("Tile");
       DEVICE_DISPATCH(input.device(),
                       TYPE_DISPATCH(input.dtype(), (compute<D, T>(input, repeats, output))));
+    }
+
+    void Tile::operator()(StorageView& input, const StorageView& repeats) const {
+      StorageView input_clone(std::move(input));
+      operator()(input_clone, repeats, input);
     }
 
   }

@@ -3,7 +3,6 @@
 #include <numeric>
 
 #include "ctranslate2/ops/ops.h"
-#include "ctranslate2/utils.h"
 
 using namespace ctranslate2;
 
@@ -89,7 +88,7 @@ void benchmark_dequantize(Device device) {
   StorageView weight_scale({1536}, DataType::FLOAT, device);
   StorageView y(device);
   const ops::Dequantize dequantize_op{};
-  BENCHMARK(dequantize_op(x, input_scale, weight_scale, y), 100000);
+  BENCHMARK(dequantize_op(x, input_scale, weight_scale, false, true, y), 100000);
 }
 
 int main(int argc, char* argv[]) {
@@ -106,8 +105,6 @@ int main(int argc, char* argv[]) {
     dtype = DataType::INT16;
   else if (dtype_str == "int8")
     dtype = DataType::INT8;
-
-  ctranslate2::set_num_threads(4);
 
   if (op == "gather")
     benchmark_gather(device);

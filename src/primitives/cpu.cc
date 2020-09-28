@@ -1,50 +1,27 @@
 #include "ctranslate2/primitives/primitives.h"
 
-#include <algorithm>
 #include <cmath>
 #include <functional>
 #include <numeric>
 #include <stdexcept>
 
-#ifdef WITH_MKL
+#ifdef CT2_WITH_MKL
 #  include <mkl.h>
 #endif
 
-#include "ctranslate2/utils.h"
+#ifdef CT2_WITH_DNNL
+#  include <dnnl.h>
+#endif
 
-#include "./parallel.h"
+#include "ctranslate2/utils.h"
+#include "cpu/backend.h"
+#include "cpu/kernels.h"
+#include "cpu/parallel.h"
+#include "type_dispatch.h"
 
 #define ALIGNMENT 64
 
 namespace ctranslate2 {
-
-  // work_size is an estimation of the amount of work per index (for example,
-  // 1 for a basic operator + - *, 2 for /, and 4 for exp, log, etc.).
-
-  template <typename T1, typename T2, typename Function>
-  void unary_transform(const T1* x,
-                       T2* y,
-                       dim_t size,
-                       const Function& func,
-                       dim_t work_size = 1) {
-    parallel_for(0, size, GRAIN_SIZE / work_size,
-                 [&](dim_t begin, dim_t end) {
-                   std::transform(x + begin, x + end, y + begin, func);
-                 });
-  }
-
-  template <typename T1, typename T2, typename T3, typename Function>
-  void binary_transform(const T1* a,
-                        const T2* b,
-                        T3* c,
-                        dim_t size,
-                        const Function& func,
-                        dim_t work_size = 1) {
-    parallel_for(0, size, GRAIN_SIZE / work_size,
-                 [&](dim_t begin, dim_t end) {
-                   std::transform(a + begin, a + end, b + begin, c + begin, func);
-                 });
-  }
 
   template<>
   void primitives<Device::CPU>::set_device(int) {
@@ -56,18 +33,18 @@ namespace ctranslate2 {
   }
 
   template<>
-  void* primitives<Device::CPU>::alloc_data(dim_t size) {
+  void* primitives<Device::CPU>::alloc_data(dim_t size, int) {
     return aligned_alloc(size, ALIGNMENT);
   }
 
   template<>
-  void primitives<Device::CPU>::free_data(void* data) {
+  void primitives<Device::CPU>::free_data(void* data, int) {
     aligned_free(data);
   }
 
   template<>
   void primitives<Device::CPU>::clear_cache() {
-#ifdef WITH_MKL
+#ifdef CT2_WITH_MKL
     mkl_free_buffers();
 #endif
   }
@@ -81,7 +58,7 @@ namespace ctranslate2 {
   template<>
   template <typename T>
   void primitives<Device::CPU>::fill(T* x, T a, dim_t size) {
-    std::fill_n(x, size, a);
+    std::fill(x, x + size, a);
   }
 
   template<>
@@ -92,24 +69,35 @@ namespace ctranslate2 {
     }
   }
 
-  template<>
-  template <typename T>
-  void primitives<Device::CPU>::copy(const T* x, T* y, dim_t size) {
-    std::copy_n(x, size, y);
-  }
-
-#ifdef WITH_MKL
+#ifdef CT2_WITH_MKL
   template<>
   template<>
-  void primitives<Device::CPU>::copy(const float* x, float* y, dim_t size) {
-    cblas_scopy(size, x, 1 /* incx */, y, 1 /* incy */);
+  void primitives<Device::CPU>::strided_fill(float* x, float a, dim_t inc_x, dim_t size) {
+    cblas_scopy(size, &a, /*incx=*/0, x, inc_x);
   }
 #endif
 
   template<>
   template <typename T>
+  void primitives<Device::CPU>::copy(const T* x, T* y, dim_t size) {
+    std::copy(x, x + size, y);
+  }
+
+  template<>
+  template <typename U, typename V>
+  void primitives<Device::CPU>::convert(const U* x, V* y, dim_t size) {
+    std::copy(x, x + size, y);
+  }
+
+  template void primitives<Device::CPU>::convert(const float*, float16_t*, dim_t);
+  template void primitives<Device::CPU>::convert(const float16_t*, float*, dim_t);
+
+  template<>
+  template <typename T>
   T primitives<Device::CPU>::sum(const T* array, dim_t size) {
-    return std::accumulate(array, array + size, static_cast<T>(0));
+    auto sum = T(0);
+    CPU_ISA_DISPATCH((sum = cpu::reduce_sum<ISA>(array, size)));
+    return sum;
   }
 
   template<>
@@ -121,45 +109,68 @@ namespace ctranslate2 {
   template<>
   template <typename T>
   T primitives<Device::CPU>::max(const T* array, dim_t size) {
-    return *std::max_element(array, array + size);
+    auto max = T(0);
+    CPU_ISA_DISPATCH((max = cpu::reduce_max<ISA>(array, size)));
+    return max;
   }
 
   template<>
   template <typename T>
   T primitives<Device::CPU>::amax(const T* array, dim_t size) {
-    return std::abs(*std::max_element(array, array + size,
-                                      [](T a, T b){
-                                        return std::abs(a) < std::abs(b);
-                                      }));
+    auto max = T(0);
+    CPU_ISA_DISPATCH((max = cpu::reduce_amax<ISA>(array, size)));
+    return max;
   }
 
-#ifdef WITH_MKL
   template<>
   template<>
   float primitives<Device::CPU>::amax(const float* x, dim_t size) {
-    return std::abs(x[cblas_isamax(size, x, /*incx=*/1)]);
-  }
+#ifdef CT2_WITH_MKL
+    if (cpu::mayiuse_mkl())
+      return std::abs(x[cblas_isamax(size, x, /*incx=*/1)]);
 #endif
+    float max = 0;
+    CPU_ISA_DISPATCH((max = cpu::reduce_amax<ISA>(x, size)));
+    return max;
+  }
+
+  template<>
+  template <typename T>
+  void primitives<Device::CPU>::row_max(const T* x,
+                                        const dim_t rows,
+                                        const dim_t cols,
+                                        T* values,
+                                        int32_t* indices) {
+    #pragma omp parallel for
+    for (dim_t i = 0; i < rows; ++i) {
+      const T* row = x + i * cols;
+      const T* max = std::max_element(row, row + cols);
+      values[i] = *max;
+      indices[i] = std::distance(row, max);
+    }
+  }
 
   template<>
   template <typename T>
   void primitives<Device::CPU>::add(T a, const T* x, T* y, dim_t size) {
-    unary_transform(x, y, size, [&a](T v) { return v + a; });
+    CPU_ISA_DISPATCH((cpu::add<ISA>(a, x, y, size)));
   }
 
   template<>
   template <typename T>
   void primitives<Device::CPU>::add(const T* a, const T* b, T* c, dim_t size) {
-    binary_transform(a, b, c, size, std::plus<T>());
+    CPU_ISA_DISPATCH((cpu::add<ISA>(a, b, c, size)));
   }
 
-#ifdef WITH_MKL
   template<>
   template<>
   void primitives<Device::CPU>::add(const float* a, const float* b, float* c, dim_t size) {
-    vsAdd(size, a, b, c);
-  }
+#ifdef CT2_WITH_MKL
+    if (cpu::mayiuse_mkl())
+      return vsAdd(size, a, b, c);
 #endif
+    CPU_ISA_DISPATCH((cpu::add<ISA>(a, b, c, size)));
+  }
 
   template<>
   template <typename T>
@@ -189,44 +200,94 @@ namespace ctranslate2 {
   template<>
   template <typename T>
   void primitives<Device::CPU>::sub(const T* a, const T* b, T* c, dim_t size) {
-    binary_transform(a, b, c, size, std::minus<T>());
+    CPU_ISA_DISPATCH((cpu::sub<ISA>(a, b, c, size)));
   }
 
-#ifdef WITH_MKL
   template<>
   template<>
   void primitives<Device::CPU>::sub(const float* a, const float* b, float* c, dim_t size) {
-    vsSub(size, a, b, c);
-  }
+#ifdef CT2_WITH_MKL
+    if (cpu::mayiuse_mkl())
+      return vsSub(size, a, b, c);
 #endif
+    CPU_ISA_DISPATCH((cpu::sub<ISA>(a, b, c, size)));
+  }
+
+  template<>
+  template <typename T>
+  void primitives<Device::CPU>::max(T a, const T* x, T* y, dim_t size){
+    CPU_ISA_DISPATCH((cpu::max<ISA>(a, x, y, size)));
+  }
+
+  template<>
+  template <typename T>
+  void primitives<Device::CPU>::max(const T* a, const T* b, T* c, dim_t size){
+    CPU_ISA_DISPATCH((cpu::max<ISA>(a, b, c, size)));
+  }
+
+  template<>
+  template<>
+  void primitives<Device::CPU>::max(const float* a, const float* b, float* c, dim_t size) {
+#ifdef CT2_WITH_MKL
+    if (cpu::mayiuse_mkl())
+      return vsFmax(size, a, b, c);
+#endif
+    CPU_ISA_DISPATCH((cpu::max<ISA>(a, b, c, size)));
+  }
+
+  template<>
+  template <typename T>
+  void primitives<Device::CPU>::min(T a, const T* x, T* y, dim_t size){
+    CPU_ISA_DISPATCH((cpu::min<ISA>(a, x, y, size)));
+  }
+
+  template<>
+  template <typename T>
+  void primitives<Device::CPU>::min(const T* a, const T* b, T* c, dim_t size){
+    CPU_ISA_DISPATCH((cpu::min<ISA>(a, b, c, size)));
+  }
+
+  template<>
+  template<>
+  void primitives<Device::CPU>::min(const float* a, const float* b, float* c, dim_t size) {
+#ifdef CT2_WITH_MKL
+    if (cpu::mayiuse_mkl())
+      return vsFmin(size, a, b, c);
+#endif
+    CPU_ISA_DISPATCH((cpu::min<ISA>(a, b, c, size)));
+  }
 
   template<>
   template <typename T>
   void primitives<Device::CPU>::mul(T a, const T* x, T* y, dim_t size) {
-    unary_transform(x, y, size, [&a](T v) { return v * a; });
+    CPU_ISA_DISPATCH((cpu::mul<ISA>(a, x, y, size)));
   }
 
-#ifdef WITH_MKL
   template<>
   template<>
   void primitives<Device::CPU>::mul(float a, const float* x, float* y, dim_t size) {
-    cblas_saxpby(size, a, x, 1 /* incx */, 0 /* b */, y, 1 /* incy */);
-  }
+#ifdef CT2_WITH_MKL
+    if (cpu::mayiuse_mkl())
+      return cblas_saxpby(size, a, x, 1 /* incx */, 0 /* b */, y, 1 /* incy */);
 #endif
+    CPU_ISA_DISPATCH((cpu::mul<ISA>(a, x, y, size)));
+  }
 
   template<>
   template <typename T>
   void primitives<Device::CPU>::mul(const T* a, const T* b, T* c, dim_t size) {
-    binary_transform(a, b, c, size, std::multiplies<T>());
+    CPU_ISA_DISPATCH((cpu::mul<ISA>(a, b, c, size)));
   }
 
-#ifdef WITH_MKL
   template<>
   template<>
   void primitives<Device::CPU>::mul(const float* a, const float* b, float* c, dim_t size) {
-    vsMul(size, a, b, c);
-  }
+#ifdef CT2_WITH_MKL
+    if (cpu::mayiuse_mkl())
+      return vsMul(size, a, b, c);
 #endif
+    CPU_ISA_DISPATCH((cpu::mul<ISA>(a, b, c, size)));
+  }
 
   template<>
   template <typename T>
@@ -241,163 +302,72 @@ namespace ctranslate2 {
   }
 
   template<>
-  template <typename T>
-  void primitives<Device::CPU>::inv(const T* x, T* y, dim_t size) {
-    unary_transform(x, y, size, [](T v) { return static_cast<T>(1) / v; }, /*work_size=*/2);
-  }
-
-#ifdef WITH_MKL
-  template<>
-  template<>
-  void primitives<Device::CPU>::inv(const float* x, float* y, dim_t size) {
-    vsInv(size, x, y);
-  }
-#endif
-
-  template<>
-  template <typename T>
-  void primitives<Device::CPU>::quantize(const float* x,
-                                         T* y,
-                                         dim_t size,
-                                         float scale,
-                                         float shift) {
-    unary_transform(x, y, size,
-                    [scale, shift](float v) {
-                      return static_cast<T>(
-                        std::max(std::min(v * scale + shift,
-                                          static_cast<float>(std::numeric_limits<T>::max())),
-                                 static_cast<float>(std::numeric_limits<T>::lowest())));
-                    }, /*work_size=*/5);
-  }
-
-  template<>
-  template <typename T>
-  void primitives<Device::CPU>::dequantize(const T* x,
-                                           float* y,
-                                           dim_t size,
-                                           float scale,
-                                           float shift) {
-    unary_transform(x, y, size,
-                    [scale, shift](T v) {
-                      return (static_cast<float>(v) - shift) / scale;
-                    }, /*work_size=*/4);
-  }
-
-  template<>
-  template <typename T>
-  void primitives<Device::CPU>::dequantize_batch(const T* x, const float* scale, float* y,
-                                                 dim_t x_size, dim_t scale_size, float shift) {
-    const dim_t depth = x_size / scale_size;
-    #pragma omp parallel for
-    for (dim_t i = 0; i < scale_size; ++i) {
-      const dim_t offset = i * depth;
-      dequantize(x + offset, y + offset, depth, scale[i], shift);
-    }
-  }
-
-  template<>
-  void primitives<Device::CPU>::quantize_batch(const float* x,
-                                               float* scales,
-                                               int8_t* qx,
-                                               dim_t batch_size,
-                                               dim_t depth,
-                                               float shift) {
-    #pragma omp parallel for
-    for (dim_t i = 0; i < batch_size; ++i) {
-      const float* row = x + i * depth;
-      int8_t* qrow = qx + i * depth;
-      auto scale = static_cast<float>(std::numeric_limits<int8_t>::max()) / amax(row, depth);
-      unary_transform(row, qrow, depth,
-                      [scale, shift](float v) {
-                        return static_cast<int8_t>(v * scale + shift);
-                      });
-      scales[i] = scale;
-    }
-  }
-
-  template<>
-  void primitives<Device::CPU>::rescale_output(const int32_t* x,
-                                               const float* input_scales,
-                                               const float* weight_scales,
-                                               float* y,
-                                               dim_t batch_size,
-                                               dim_t depth) {
-    #pragma omp parallel for
-    for (dim_t i = 0; i < batch_size; ++i) {
-      for (dim_t j = 0; j < depth; ++j) {
-        const dim_t index = j + i * depth;
-        y[index] = static_cast<float>(x[index]) / (input_scales[i] * weight_scales[j]);
-      }
-    }
-  }
-
   template<>
   void primitives<Device::CPU>::relu(const float* x, float* y, dim_t size) {
-    unary_transform(x, y, size, [](float v) { return std::max(v, static_cast<float>(0)); });
+    cpu::parallel_for(0, size, /*work_size=*/1,
+                      [x, y](dim_t begin, dim_t end) {
+                        max(float(0), x + begin, y + begin, end - begin);
+                      });
   }
 
   template<>
   void primitives<Device::CPU>::gelu(const float* x, float* y, dim_t size) {
+#ifdef CT2_WITH_MKL
+    if (cpu::mayiuse_mkl()) {
+      const bool inplace = (x == y);
+      float* tmp = y;
+      if (inplace)
+        tmp = static_cast<float*>(alloc_data(size * sizeof (float)));
+      vsCdfNorm(size, x, tmp);
+      vsMul(size, x, tmp, y);
+      if (inplace)
+        free_data(tmp);
+      return;
+    }
+#endif
     static const float pi = std::acos(-1.f);
     static const float scale = std::sqrt(2.f / pi);
-    unary_transform(x, y, size,
-                    [](float v) {
-                      return 0.5f * v * (1.f + std::tanh(scale * (v + 0.044715f * std::pow(v, 3.f))));
-                    }, /*work_size=*/14);
-  }
-
-  template<>
-  void primitives<Device::CPU>::pow(const float* x, float *y, float power, dim_t size) {
-#ifdef WITH_MKL
-    vsPowx(size, x, power, y);
-#else
-    unary_transform(x, y, size, [power](float v) { return std::pow(v, power); }, /*work_size=*/4);
-#endif
+    cpu::parallel_unary_transform(
+      x, y, size, /*work_size=*/14,
+      [](float v) {
+        return 0.5f * v * (1.f + std::tanh(scale * (v + 0.044715f * std::pow(v, 3.f))));
+      });
   }
 
   template<>
   void primitives<Device::CPU>::exp(const float* x, float* y, dim_t size) {
-#ifdef WITH_MKL
-    vmsExp(size, x, y, VML_EP | VML_FTZDAZ_ON | VML_ERRMODE_IGNORE);
-#else
-    unary_transform(x, y, size, [](float v) { return std::exp(v); }, /*work_size=*/4);
+#ifdef CT2_WITH_MKL
+    if (cpu::mayiuse_mkl())
+      return vsExp(size, x, y);
 #endif
+    CPU_ISA_DISPATCH((cpu::exp<ISA>(x, y, size)));
   }
 
   template<>
   void primitives<Device::CPU>::log(const float* x, float* y, dim_t size) {
-#ifdef WITH_MKL
-    vmsLn(size, x, y, VML_EP | VML_FTZDAZ_ON | VML_ERRMODE_IGNORE);
-#else
-    unary_transform(x, y, size, [](float v) { return std::log(v); }, /*work_size=*/4);
+#ifdef CT2_WITH_MKL
+    if (cpu::mayiuse_mkl())
+      return vsLn(size, x, y);
 #endif
+    CPU_ISA_DISPATCH((cpu::log<ISA>(x, y, size)));
   }
 
   template<>
   void primitives<Device::CPU>::cos(const float* x, float* y, dim_t size) {
-#ifdef WITH_MKL
-    vsCos(size, x, y);
-#else
-    unary_transform(x, y, size, [](float v) { return std::cos(v); }, /*work_size=*/4);
+#ifdef CT2_WITH_MKL
+    if (cpu::mayiuse_mkl())
+      return vsCos(size, x, y);
 #endif
+    CPU_ISA_DISPATCH((cpu::cos<ISA>(x, y, size)));
   }
 
   template<>
   void primitives<Device::CPU>::sin(const float* x, float* y, dim_t size) {
-#ifdef WITH_MKL
-    vsSin(size, x, y);
-#else
-    unary_transform(x, y, size, [](float v) { return std::sin(v); }; /*work_size=*/4);
+#ifdef CT2_WITH_MKL
+    if (cpu::mayiuse_mkl())
+      return vsSin(size, x, y);
 #endif
-  }
-
-  template<>
-  void primitives<Device::CPU>::tanh(const float* x, float* y, dim_t size) {
-#ifdef WITH_MKL
-    vsTanh(size, x, y);
-#else
-    unary_transform(x, y, size, [](float v) { return std::tanh(v); }, /*work_size=*/4);
-#endif
+    CPU_ISA_DISPATCH((cpu::sin<ISA>(x, y, size)));
   }
 
   template<>
@@ -411,7 +381,7 @@ namespace ctranslate2 {
     }
   }
 
-#ifdef WITH_MKL
+#ifdef CT2_WITH_MKL
   template<>
   template<>
   void primitives<Device::CPU>::transpose_2d(const float* a, const dim_t* dims, float* b) {
@@ -455,6 +425,25 @@ namespace ctranslate2 {
                                              const dim_t* dims,
                                              const dim_t* perm,
                                              T* b) {
+    if (perm[0] == 0 && perm[1] == 2 && perm[2] == 1 && perm[3] == 3) {
+      // Optimize the permutation used in multi-head attention.
+      const dim_t r1 = dims[2];
+      const dim_t r2 = dims[1];
+      const dim_t depth = dims[3];
+
+      #pragma omp parallel for
+      for (dim_t i = 0; i < dims[0]; ++i) {
+        const dim_t offset = i * r1 * r2;
+        for (dim_t j = 0; j < r1 * r2; ++j) {
+          const dim_t a_offset = depth * (offset + j);
+          const dim_t b_offset = depth * (offset + j / r1 + (j % r1) * r2);
+          copy(a + a_offset, b + b_offset, depth);
+        }
+      }
+
+      return;
+    }
+
     dim_t perm_ind[4];
     for (dim_t i = 0; i < 4; ++i)
       perm_ind[perm[i]] = i;
@@ -480,71 +469,209 @@ namespace ctranslate2 {
     }
   }
 
+  static cpu::GemmBackend sgemm_backend = cpu::get_gemm_backend(ComputeType::FLOAT);
+  static cpu::GemmBackend gemm_s8_backend = cpu::get_gemm_backend(ComputeType::INT8);
+  static cpu::GemmBackend gemm_s16_backend = cpu::get_gemm_backend(ComputeType::INT16);
+
+#ifdef CT2_WITH_MKL
+  // m value used to pack the b matrix.
+  constexpr MKL_INT mkl_gemm_pack_b_m = 1;
+#endif
+
+  template<>
+  template<>
+  dim_t primitives<Device::CPU>::gemm_pack_b(const float* b,
+                                             const bool transpose_b,
+                                             const dim_t k,
+                                             const dim_t n,
+                                             const float alpha,
+                                             float* dest) {
+#ifdef CT2_WITH_MKL
+    if (sgemm_backend == cpu::GemmBackend::MKL) {
+      if (!dest)
+        return cblas_sgemm_pack_get_size(CblasBMatrix, mkl_gemm_pack_b_m, n, k);
+      cblas_sgemm_pack(CblasRowMajor,
+                       CblasBMatrix,
+                       transpose_b ? CblasTrans : CblasNoTrans,
+                       mkl_gemm_pack_b_m, n, k,
+                       alpha,
+                       b,
+                       transpose_b ? k : n,
+                       dest);
+    }
+#endif
+    return 0;
+  }
+
+  template<>
+  template<>
+  dim_t primitives<Device::CPU>::gemm_pack_b(const int16_t* b,
+                                             const bool transpose_b,
+                                             const dim_t k,
+                                             const dim_t n,
+                                             const float,
+                                             int16_t* dest) {
+#ifdef CT2_WITH_MKL
+    if (gemm_s16_backend == cpu::GemmBackend::MKL) {
+      if (!dest)
+        return cblas_gemm_s16s16s32_pack_get_size(CblasBMatrix, mkl_gemm_pack_b_m, n, k);
+      cblas_gemm_s16s16s32_pack(CblasRowMajor,
+                                CblasBMatrix,
+                                transpose_b ? CblasTrans : CblasNoTrans,
+                                mkl_gemm_pack_b_m, n, k,
+                                b,
+                                transpose_b ? k : n,
+                                dest);
+    }
+#endif
+    return 0;
+  }
+
+  template<>
+  template<>
+  dim_t primitives<Device::CPU>::gemm_pack_b(const int8_t* b,
+                                             const bool transpose_b,
+                                             const dim_t k,
+                                             const dim_t n,
+                                             const float,
+                                             int8_t* dest) {
+#ifdef CT2_WITH_MKL
+    if (gemm_s8_backend == cpu::GemmBackend::MKL) {
+      if (!dest)
+        return cblas_gemm_s8u8s32_pack_get_size(CblasBMatrix, mkl_gemm_pack_b_m, n, k);
+      cblas_gemm_s8u8s32_pack(CblasRowMajor,
+                              CblasBMatrix,
+                              transpose_b ? CblasTrans : CblasNoTrans,
+                              mkl_gemm_pack_b_m, n, k,
+                              b,
+                              transpose_b ? k : n,
+                              dest);
+    }
+#endif
+    return 0;
+  }
 
   template<>
   template<>
   void primitives<Device::CPU>::gemm(const float* a, const float* b,
+                                     bool a_is_packed, bool b_is_packed,
                                      bool transpose_a, bool transpose_b,
                                      dim_t m, dim_t n, dim_t k,
                                      float alpha, float beta,
                                      float* c,
                                      const float*) {
-#ifdef WITH_MKL
-    MKL_INT lda = transpose_a ? m : k;
-    MKL_INT ldb = transpose_b ? k : n;
-    MKL_INT ldc = n;
+    const dim_t lda = transpose_a ? m : k;
+    const dim_t ldb = transpose_b ? k : n;
+    const dim_t ldc = n;
 
-    CBLAS_TRANSPOSE trans_a = transpose_a ? CblasTrans : CblasNoTrans;
-    CBLAS_TRANSPOSE trans_b = transpose_b ? CblasTrans : CblasNoTrans;
+    switch (sgemm_backend) {
 
-    cblas_sgemm(CblasRowMajor,
-                trans_a, trans_b,
-                m, n, k,
-                alpha, a, lda,
-                b, ldb,
-                beta, c, ldc);
-#else
-    throw std::runtime_error("SGEMM not available for CPU");
+#ifdef CT2_WITH_MKL
+    case cpu::GemmBackend::MKL: {
+      CBLAS_TRANSPOSE trans_a = transpose_a ? CblasTrans : CblasNoTrans;
+      CBLAS_TRANSPOSE trans_b = transpose_b ? CblasTrans : CblasNoTrans;
+
+      if (a_is_packed || b_is_packed) {
+        cblas_sgemm_compute(CblasRowMajor,
+                            a_is_packed ? (MKL_INT)CblasPacked : (MKL_INT)trans_a,
+                            b_is_packed ? (MKL_INT)CblasPacked : (MKL_INT)trans_b,
+                            m, n, k,
+                            a, lda,
+                            b, ldb,
+                            beta, c, ldc);
+      } else {
+        cblas_sgemm(CblasRowMajor,
+                    trans_a, trans_b,
+                    m, n, k,
+                    alpha,
+                    a, lda,
+                    b, ldb,
+                    beta,
+                    c, ldc);
+      }
+      break;
+    }
 #endif
+
+#ifdef CT2_WITH_DNNL
+    case cpu::GemmBackend::DNNL: {
+      dnnl_sgemm(transpose_a ? 'T' : 'N',
+                 transpose_b ? 'T' : 'N',
+                 m, n, k,
+                 alpha,
+                 a, lda,
+                 b, ldb,
+                 beta,
+                 c, ldc);
+      break;
+    }
+#endif
+
+    default:
+      throw std::runtime_error("No SGEMM backend on CPU");
+    }
   }
 
   template<>
   template<>
   void primitives<Device::CPU>::gemm(const int16_t* a, const int16_t* b,
+                                     bool a_is_packed, bool b_is_packed,
                                      bool transpose_a, bool transpose_b,
                                      dim_t m, dim_t n, dim_t k,
                                      float alpha, float beta,
                                      int32_t* c,
                                      const int32_t*) {
-#ifdef WITH_MKL
-    MKL_INT lda = transpose_a ? m : k;
-    MKL_INT ldb = transpose_b ? k : n;
-    MKL_INT ldc = n;
+    switch (gemm_s16_backend) {
 
-    CBLAS_TRANSPOSE trans_a = transpose_a ? CblasTrans : CblasNoTrans;
-    CBLAS_TRANSPOSE trans_b = transpose_b ? CblasTrans : CblasNoTrans;
-    CBLAS_OFFSET offsetc = CblasFixOffset;
+#ifdef CT2_WITH_MKL
+    case cpu::GemmBackend::MKL: {
+      MKL_INT lda = transpose_a ? m : k;
+      MKL_INT ldb = transpose_b ? k : n;
+      MKL_INT ldc = n;
 
-    MKL_INT16 oa = 0;
-    MKL_INT16 ob = 0;
-    MKL_INT32 oc = 0;
+      CBLAS_TRANSPOSE trans_a = transpose_a ? CblasTrans : CblasNoTrans;
+      CBLAS_TRANSPOSE trans_b = transpose_b ? CblasTrans : CblasNoTrans;
+      CBLAS_OFFSET offsetc = CblasFixOffset;
 
-    cblas_gemm_s16s16s32(CblasRowMajor,
-                         trans_a, trans_b,
-                         offsetc, m, n, k,
-                         alpha,
-                         reinterpret_cast<const MKL_INT16*>(a), lda, oa,
-                         reinterpret_cast<const MKL_INT16*>(b), ldb, ob,
-                         beta,
-                         reinterpret_cast<MKL_INT32*>(c), ldc, &oc);
-#else
-    throw std::runtime_error("INT16 GEMM not available for CPU");
+      MKL_INT16 oa = 0;
+      MKL_INT16 ob = 0;
+      MKL_INT32 oc = 0;
+
+      if (a_is_packed || b_is_packed) {
+        cblas_gemm_s16s16s32_compute(CblasRowMajor,
+                                     a_is_packed ? (MKL_INT)CblasPacked : (MKL_INT)trans_a,
+                                     b_is_packed ? (MKL_INT)CblasPacked : (MKL_INT)trans_b,
+                                     offsetc, m, n, k,
+                                     alpha,
+                                     a, lda, oa,
+                                     b, ldb, ob,
+                                     beta,
+                                     c, ldc, &oc);
+      } else {
+        cblas_gemm_s16s16s32(CblasRowMajor,
+                             trans_a, trans_b,
+                             offsetc, m, n, k,
+                             alpha,
+                             a, lda, oa,
+                             b, ldb, ob,
+                             beta,
+                             c, ldc, &oc);
+
+      }
+      break;
+    }
 #endif
+
+    default:
+      throw std::runtime_error("No INT16 GEMM backend on CPU");
+    }
   }
 
+#ifdef CT2_WITH_MKL
   static void shift_to_u8(const int8_t* x, uint8_t* ux, dim_t size) {
-    unary_transform(x, ux, size, [](int8_t v) { return static_cast<uint8_t>(v + 128); });
+    cpu::unary_transform(x, ux, size, [](int8_t v) { return static_cast<uint8_t>(v + 128); });
   }
+#endif
 
   template<>
   void primitives<Device::CPU>::compute_u8_compensation(const int8_t* b,
@@ -576,70 +703,118 @@ namespace ctranslate2 {
     }
   }
 
-  template<>
-  bool primitives<Device::CPU>::prefer_u8s8s32_gemm() {
-#ifdef WITH_MKL
-    return true;
-#else
-    return false;
-#endif
-  }
-
 
   template<>
   template<>
   void primitives<Device::CPU>::gemm(const int8_t* a, const int8_t* b,
+                                     bool a_is_packed, bool b_is_packed,
                                      bool transpose_a, bool transpose_b,
                                      dim_t m, dim_t n, dim_t k,
                                      float alpha, float beta,
                                      int32_t* c,
                                      const int32_t* a_shift_compensation) {
-#ifdef WITH_MKL
-    // We are implementing s8s8s32 GEMM with cblas_gemm_s8u8s32. In row major mode,
-    // it expects a to be unsigned and b to be signed. So we need to shift a to the
-    // uint8 domain and add a compensation term. For more details, see
-    // https://intel.github.io/mkl-dnn/dev_guide_int8_computations.html
+    const dim_t lda = transpose_a ? m : k;
+    const dim_t ldb = transpose_b ? k : n;
+    const dim_t ldc = n;
 
-    const uint8_t* ua = nullptr;
-    uint8_t* tmp_ua = nullptr;
-    int32_t* tmp_a_shift_compensation = nullptr;
+    switch (gemm_s8_backend) {
 
-    if (a_shift_compensation) {
-      // If the compensation term is passed as argument, we assume a is already shifted.
-      ua = reinterpret_cast<const uint8_t*>(a);
-    } else {
-      const dim_t a_size = m * k;
-      tmp_ua = static_cast<uint8_t*>(alloc_data(a_size));
-      shift_to_u8(a, tmp_ua, a_size);
-      ua = tmp_ua;
+#ifdef CT2_WITH_MKL
+    case cpu::GemmBackend::MKL: {
+      // We are implementing s8s8s32 GEMM with cblas_gemm_s8u8s32. In row major mode,
+      // it expects a to be unsigned and b to be signed. So we need to shift a to the
+      // uint8 domain and add a compensation term. For more details, see
+      // https://intel.github.io/mkl-dnn/dev_guide_int8_computations.html
 
-      tmp_a_shift_compensation = static_cast<int32_t*>(alloc_data(n * sizeof (int32_t)));
-      compute_u8_compensation(b, transpose_b, k, n, alpha, tmp_a_shift_compensation);
-      a_shift_compensation = tmp_a_shift_compensation;
+      const bool use_packed_api = a_is_packed || b_is_packed;
+      const uint8_t* ua = nullptr;
+      uint8_t* tmp_ua = nullptr;
+      int32_t* tmp_a_shift_compensation = nullptr;
+
+      if (a_shift_compensation) {
+        // If the compensation term is passed as argument, we assume a is already shifted.
+        ua = reinterpret_cast<const uint8_t*>(a);
+      } else if (use_packed_api) {
+        throw std::invalid_argument("Packed cblas_gemm_s8u8s32 requires the uint8 shift "
+                                    "compensation term to be passed as argument");
+      } else {
+        const dim_t a_size = m * k;
+        tmp_ua = static_cast<uint8_t*>(alloc_data(a_size));
+        shift_to_u8(a, tmp_ua, a_size);
+        ua = tmp_ua;
+
+        tmp_a_shift_compensation = static_cast<int32_t*>(alloc_data(n * sizeof (int32_t)));
+        compute_u8_compensation(b, transpose_b, k, n, alpha, tmp_a_shift_compensation);
+        a_shift_compensation = tmp_a_shift_compensation;
+      }
+
+      const CBLAS_TRANSPOSE trans_a = transpose_a ? CblasTrans : CblasNoTrans;
+      const CBLAS_TRANSPOSE trans_b = transpose_b ? CblasTrans : CblasNoTrans;
+
+      if (use_packed_api) {
+        cblas_gemm_s8u8s32_compute(CblasRowMajor,
+                                   a_is_packed ? (MKL_INT)CblasPacked : (MKL_INT)trans_a,
+                                   b_is_packed ? (MKL_INT)CblasPacked : (MKL_INT)trans_b,
+                                   CblasRowOffset,
+                                   m, n, k,
+                                   alpha,
+                                   ua, lda, 0,
+                                   b, ldb, 0,
+                                   beta,
+                                   c, ldc, a_shift_compensation);
+      } else {
+        cblas_gemm_s8u8s32(CblasRowMajor,
+                           trans_a, trans_b,
+                           CblasRowOffset,
+                           m, n, k,
+                           alpha,
+                           ua, lda, 0,
+                           b, ldb, 0,
+                           beta,
+                           c, ldc, a_shift_compensation);
+      }
+
+      if (tmp_ua)
+        free_data(tmp_ua);
+      if (tmp_a_shift_compensation)
+        free_data(tmp_a_shift_compensation);
+      break;
     }
-
-    const MKL_INT lda = transpose_a ? m : k;
-    const MKL_INT ldb = transpose_b ? k : n;
-    const MKL_INT ldc = n;
-
-    cblas_gemm_s8u8s32(CblasRowMajor,
-                       transpose_a ? CblasTrans : CblasNoTrans,
-                       transpose_b ? CblasTrans : CblasNoTrans,
-                       CblasRowOffset,
-                       m, n, k,
-                       alpha,
-                       ua, lda, 0,
-                       b, ldb, 0,
-                       beta,
-                       c, ldc, a_shift_compensation);
-
-    if (tmp_ua)
-      free_data(tmp_ua);
-    if (tmp_a_shift_compensation)
-      free_data(tmp_a_shift_compensation);
-#else
-    throw std::runtime_error("INT8 GEMM not available for CPU");
 #endif
+
+#ifdef CT2_WITH_DNNL
+    case cpu::GemmBackend::DNNL: {
+      const char transa = transpose_a ? 'T' : 'N';
+      const char transb = transpose_b ? 'T' : 'N';
+
+      if (a_shift_compensation) {
+        // If the compensation term is passed as argument, we assume a is already shifted.
+        dnnl_gemm_u8s8s32(transa, transb,
+                          'R',
+                          m, n, k,
+                          alpha,
+                          reinterpret_cast<const uint8_t*>(a), lda, 0,
+                          b, ldb, 0,
+                          beta,
+                          c, ldc, a_shift_compensation);
+      } else {
+        const int32_t co = 0;
+        dnnl_gemm_s8s8s32(transa, transb,
+                          'F',
+                          m, n, k,
+                          alpha,
+                          a, lda, 0,
+                          b, ldb, 0,
+                          beta,
+                          c, ldc, &co);
+      }
+      break;
+    }
+#endif
+
+    default:
+      throw std::runtime_error("No INT8 GEMM backend for CPU");
+    }
   }
 
   template<>
@@ -650,48 +825,79 @@ namespace ctranslate2 {
                                            dim_t m, dim_t n, dim_t k,
                                            float alpha, float beta,
                                            float* c) {
-#ifdef WITH_MKL
-    MKL_INT lda = transpose_a ? m : k;
-    MKL_INT ldb = transpose_b ? k : n;
-    MKL_INT ldc = n;
+    switch (sgemm_backend) {
 
-    MKL_INT b_ = batch_size;
-    MKL_INT m_ = m;
-    MKL_INT n_ = n;
-    MKL_INT k_ = k;
+#ifdef CT2_WITH_MKL
+    case cpu::GemmBackend::MKL: {
+      MKL_INT lda = transpose_a ? m : k;
+      MKL_INT ldb = transpose_b ? k : n;
+      MKL_INT ldc = n;
 
-    CBLAS_TRANSPOSE trans_a = transpose_a ? CblasTrans : CblasNoTrans;
-    CBLAS_TRANSPOSE trans_b = transpose_b ? CblasTrans : CblasNoTrans;
+      MKL_INT b_ = batch_size;
+      MKL_INT m_ = m;
+      MKL_INT n_ = n;
+      MKL_INT k_ = k;
 
-    auto ptr_array = static_cast<float**>(alloc_data(3 * batch_size * sizeof (float*)));
-    auto a_array = const_cast<const float**>(ptr_array);
-    auto b_array = const_cast<const float**>(ptr_array + batch_size);
-    auto c_array = ptr_array + 2 * batch_size;
-    for (MKL_INT i = 0; i < b_; ++i) {
-      a_array[i] = a + (i * m_ * k_);
-      b_array[i] = b + (i * k_ * n_);
-      c_array[i] = c + (i * m_ * n_);
-    }
+      MKL_INT stridea = m_ * k_;
+      MKL_INT strideb = k_ * n_;
+      MKL_INT stridec = m_ * n_;
 
-    cblas_sgemm_batch(CblasRowMajor,
-                      &trans_a, &trans_b,
-                      &m_, &n_, &k_,
-                      &alpha, a_array, &lda,
-                      b_array, &ldb,
-                      &beta, c_array, &ldc,
-                      1 /* group_count */, &b_);
+      CBLAS_TRANSPOSE trans_a = transpose_a ? CblasTrans : CblasNoTrans;
+      CBLAS_TRANSPOSE trans_b = transpose_b ? CblasTrans : CblasNoTrans;
 
-    free_data(ptr_array);
-#else
-    #pragma omp parallel for
-    for (dim_t i = 0; i < batch_size; ++i) {
-      const float* a_i = a + (i * m * k);
-      const float* b_i = b + (i * k * n);
-      float* c_i = c + (i * m * n);
+#  if __INTEL_MKL__ > 2020 || (__INTEL_MKL__ == 2020 && __INTEL_MKL_UPDATE__ >= 2)
+      cblas_sgemm_batch_strided(CblasRowMajor,
+                                trans_a, trans_b,
+                                m, n, k,
+                                alpha,
+                                a, lda, stridea,
+                                b, ldb, strideb,
+                                beta,
+                                c, ldc, stridec,
+                                b_);
+#  else
+      auto ptr_array = static_cast<float**>(alloc_data(3 * batch_size * sizeof (float*)));
+      auto a_array = const_cast<const float**>(ptr_array);
+      auto b_array = const_cast<const float**>(ptr_array + batch_size);
+      auto c_array = ptr_array + 2 * batch_size;
+      for (MKL_INT i = 0; i < b_; ++i) {
+        a_array[i] = a + (i * stridea);
+        b_array[i] = b + (i * strideb);
+        c_array[i] = c + (i * stridec);
+      }
 
-      gemm(a_i, b_i, transpose_a, transpose_b, m, n, k, alpha, beta, c_i);
+      cblas_sgemm_batch(CblasRowMajor,
+                        &trans_a, &trans_b,
+                        &m_, &n_, &k_,
+                        &alpha, a_array, &lda,
+                        b_array, &ldb,
+                        &beta, c_array, &ldc,
+                        1 /* group_count */, &b_);
+
+      free_data(ptr_array);
+#  endif
+      break;
     }
 #endif
+
+    default: {
+      #pragma omp parallel for
+      for (dim_t i = 0; i < batch_size; ++i) {
+        const float* a_i = a + (i * m * k);
+        const float* b_i = b + (i * k * n);
+        float* c_i = c + (i * m * n);
+
+        gemm(a_i, b_i,
+             /*a_is_packed=*/false, /*b_is_packed=*/false,
+             transpose_a, transpose_b,
+             m, n, k,
+             alpha, beta,
+             c_i);
+      }
+      break;
+    }
+
+    }
   }
 
 
@@ -713,6 +919,12 @@ namespace ctranslate2 {
   template T                                                            \
   primitives<Device::CPU>::amax(const T* array, dim_t size);            \
   template void                                                         \
+  primitives<Device::CPU>::row_max(const T* x,                          \
+                                   const dim_t rows,                    \
+                                   const dim_t cols,                    \
+                                   T* values,                           \
+                                   int32_t* indices);                   \
+  template void                                                         \
   primitives<Device::CPU>::add(T a, const T* x, T* y, dim_t size);      \
   template void                                                         \
   primitives<Device::CPU>::add(const T* a, const T* b, T* c, dim_t size); \
@@ -725,14 +937,20 @@ namespace ctranslate2 {
   template void                                                         \
   primitives<Device::CPU>::sub(const T* a, const T* b, T* c, dim_t size); \
   template void                                                         \
+  primitives<Device::CPU>::min(T a, const T* x, T* y, dim_t size);      \
+  template void                                                         \
+  primitives<Device::CPU>::min(const T* a, const T* b, T* c, dim_t size); \
+  template void                                                         \
+  primitives<Device::CPU>::max(T a, const T* x, T* y, dim_t size);     \
+  template void                                                         \
+  primitives<Device::CPU>::max(const T* a, const T* b, T* c, dim_t size); \
+  template void                                                         \
   primitives<Device::CPU>::mul(T a, const T* x, T* y, dim_t size);      \
   template void                                                         \
   primitives<Device::CPU>::mul(const T* a, const T* b, T* c, dim_t size); \
   template void                                                         \
   primitives<Device::CPU>::mul_batch_broadcast(const T* a, const T* b, T* c, \
                                                dim_t a_size, dim_t b_size); \
-  template void                                                         \
-  primitives<Device::CPU>::inv(const T* x, T* y, dim_t size);           \
   template void                                                         \
   primitives<Device::CPU>::transpose_2d(const T* a,                     \
                                         const dim_t* dims,              \
@@ -746,22 +964,7 @@ namespace ctranslate2 {
   primitives<Device::CPU>::transpose_4d(const T* a,                     \
                                         const dim_t* dims,              \
                                         const dim_t* perm,              \
-                                        T* b);                          \
-  template void                                                         \
-  primitives<Device::CPU>::dequantize_batch(const T* x,                 \
-                                            const float* scale,         \
-                                            float* y,                   \
-                                            dim_t x_size,               \
-                                            dim_t scale_size,           \
-                                            float shift);               \
-  template void                                                         \
-  primitives<Device::CPU>::quantize(const float* x, T* y,               \
-                                    dim_t size,                         \
-                                    float scale, float shift);          \
-  template void                                                         \
-  primitives<Device::CPU>::dequantize(const T* x, float* y,             \
-                                      dim_t size,                       \
-                                      float scale, float shift);
+                                        T* b);
 
   DECLARE_ALL_TYPES(DECLARE_IMPL)
 

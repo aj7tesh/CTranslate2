@@ -1,5 +1,7 @@
 #include <ctranslate2/translator.h>
 
+#include <algorithm>
+
 #include "test_utils.h"
 
 extern std::string g_data_dir;
@@ -36,7 +38,7 @@ static DataType dtype_with_fallback(DataType dtype, Device device) {
   const bool support_int8 = mayiuse_int8(device);
   const bool support_int16 = mayiuse_int16(device);
   if (dtype == DataType::INT16 && !support_int16)
-    return DataType::FLOAT;
+    return support_int8 ? DataType::INT8 : DataType::FLOAT;
   if (dtype == DataType::INT8 && !support_int8)
     return support_int16 ? DataType::INT16 : DataType::FLOAT;
   return dtype;
@@ -132,13 +134,26 @@ TEST_P(SearchVariantTest, ReturnAttention) {
   options.beam_size = beam_size;
   options.num_hypotheses = beam_size;
   options.return_attention = true;
-  std::vector<std::string> input = {"آ" ,"ت" ,"ز" ,"م" ,"و" ,"ن"};
-  auto result = translator.translate(input, options);
-  ASSERT_TRUE(result.has_attention());
-  const auto& attention = result.attention();
-  EXPECT_EQ(attention.size(), beam_size);
-  EXPECT_EQ(attention[0].size(), 6);
-  EXPECT_EQ(attention[0][0].size(), 6);
+  const std::vector<std::vector<std::string>> inputs = {
+    {"آ", "ز", "ا"},
+    {"آ", "ت", "ز", "م", "و", "ن"}
+  };
+  const std::vector<std::pair<size_t, size_t>> expected_shapes = {
+    {4, 3},
+    {6, 6}
+  };  // (target_length, source_length)
+  const auto results = translator.translate_batch(inputs, options);
+  for (size_t i = 0; i < inputs.size(); ++i) {
+    const TranslationResult& result = results[i];
+    const auto& expected_shape = expected_shapes[i];
+    ASSERT_TRUE(result.has_attention());
+    const auto& attention = result.attention();
+    EXPECT_EQ(attention.size(), beam_size);
+    EXPECT_EQ(attention[0].size(), expected_shape.first);
+    for (const auto& vector : attention[0]) {
+      EXPECT_EQ(vector.size(), expected_shape.second);
+    }
+  }
 }
 
 TEST_P(SearchVariantTest, TranslateWithPrefix) {
@@ -268,4 +283,101 @@ TEST(TranslatorTest, TranslateBatchWithPrefixAndEmpty) {
   EXPECT_EQ(result[2].output(), (std::vector<std::string>{"a", "t", "z", "o", "m", "o", "n"}));
   EXPECT_TRUE(result[3].output().empty());
   EXPECT_EQ(result[4].output(), (std::vector<std::string>{"a", "z", "z", "a"}));
+}
+
+TEST(TranslatorTest, AlternativesFromPrefix) {
+  Translator translator = default_translator();
+  TranslationOptions options;
+  options.num_hypotheses = 10;
+  options.return_alternatives = true;
+  options.return_attention = true;
+  const std::vector<std::string> input = {"آ" ,"ت" ,"ز" ,"م" ,"و" ,"ن"};
+  const std::vector<std::string> prefix = {"a", "t"};
+  const TranslationResult result = translator.translate_with_prefix(input, prefix, options);
+  ASSERT_EQ(result.num_hypotheses(), options.num_hypotheses);
+  EXPECT_EQ(result.hypotheses()[0], (std::vector<std::string>{"a", "t", "z", "m", "o", "n"}));
+  EXPECT_EQ(result.hypotheses()[1], (std::vector<std::string>{"a", "t", "s", "u", "m", "o", "n"}));
+
+  // Tokens at the first unconstrained decoding position should be unique.
+  std::vector<std::string> tokens_at_position;
+  tokens_at_position.reserve(options.num_hypotheses);
+  for (const std::vector<std::string>& hypothesis : result.hypotheses())
+    tokens_at_position.emplace_back(hypothesis[prefix.size()]);
+  EXPECT_EQ(std::unique(tokens_at_position.begin(), tokens_at_position.end()),
+            tokens_at_position.end());
+
+  EXPECT_TRUE(result.has_attention());
+  EXPECT_EQ(result.attention()[0].size(), 6);
+}
+
+TEST(TranslatorTest, AlternativesFromScratch) {
+  Translator translator = default_translator();
+  TranslationOptions options;
+  options.num_hypotheses = 10;
+  options.return_alternatives = true;
+  const std::vector<std::string> input = {"آ" ,"ت" ,"ز" ,"م" ,"و" ,"ن"};
+  const TranslationResult result = translator.translate(input, options);
+  ASSERT_EQ(result.num_hypotheses(), options.num_hypotheses);
+  EXPECT_EQ(result.hypotheses()[0], (std::vector<std::string>{"a", "t", "z", "m", "o", "n"}));
+}
+
+TEST(TranslatorTest, AlternativesFromScratchBatch) {
+  Translator translator = default_translator();
+  TranslationOptions options;
+  options.num_hypotheses = 10;
+  options.return_alternatives = true;
+  const std::vector<std::vector<std::string>> inputs = {
+    {"آ" ,"ت" ,"ز" ,"م" ,"و" ,"ن"},
+    {"آ", "ز", "ا"}
+  };
+  const std::vector<TranslationResult> results = translator.translate_batch(inputs, options);
+  ASSERT_EQ(results.size(), inputs.size());
+  ASSERT_EQ(results[0].num_hypotheses(), options.num_hypotheses);
+  EXPECT_EQ(results[0].hypotheses()[0], (std::vector<std::string>{"a", "t", "z", "m", "o", "n"}));
+  EXPECT_EQ(results[0].hypotheses()[1], (std::vector<std::string>{"e", "t", "z", "m", "o", "n"}));
+  ASSERT_EQ(results[1].num_hypotheses(), options.num_hypotheses);
+  EXPECT_EQ(results[1].hypotheses()[0], (std::vector<std::string>{"a", "z", "z", "a"}));
+  EXPECT_EQ(results[1].hypotheses()[1], (std::vector<std::string>{"e", "z", "a"}));
+}
+
+TEST(TranslatorTest, AlternativesFromFullTarget) {
+  Translator translator = default_translator();
+  TranslationOptions options;
+  options.num_hypotheses = 4;
+  options.return_alternatives = true;
+  const std::vector<std::string> input = {"آ" ,"ت" ,"ز" ,"م" ,"و" ,"ن"};
+  const std::vector<std::string> target = {"a", "t", "z", "m", "o", "n"};
+  const TranslationResult result = translator.translate_with_prefix(input, target, options);
+  EXPECT_EQ(result.hypotheses()[0], (std::vector<std::string>{"a", "t", "z", "m", "o", "n", "e"}));
+}
+
+TEST(TranslatorTest, DetachModel) {
+  const std::vector<std::string> input = {"آ" ,"ت" ,"ز" ,"م" ,"و" ,"ن"};
+  Translator translator = default_translator();
+  translator.detach_model();
+  EXPECT_THROW(translator.translate(input), std::runtime_error);
+  Translator clone(translator);
+  EXPECT_THROW(clone.translate(input), std::runtime_error);
+  translator.set_model(models::Model::load(g_data_dir + "/models/v2/aren-transliteration",
+                                           Device::CPU));
+  translator.translate(input);
+}
+
+TEST(TranslatorTest, InvalidNumHypotheses) {
+  Translator translator = default_translator();
+  TranslationOptions options;
+  options.num_hypotheses = 0;
+  std::vector<std::string> input = {"آ" ,"ت" ,"ز" ,"م" ,"و" ,"ن"};
+  EXPECT_THROW(translator.translate(input, options), std::invalid_argument);
+}
+
+TEST(TranslatorTest, IgnoreScore) {
+  Translator translator = default_translator();
+  TranslationOptions options;
+  options.beam_size = 1;
+  options.return_scores = false;
+  const std::vector<std::string> input = {"آ" ,"ت" ,"ز" ,"م" ,"و" ,"ن"};
+  const TranslationResult result = translator.translate(input, options);
+  EXPECT_FALSE(result.has_scores());
+  EXPECT_EQ(result.output(), (std::vector<std::string>{"a", "t", "z", "m", "o", "n"}));
 }

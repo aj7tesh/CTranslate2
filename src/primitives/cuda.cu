@@ -1,45 +1,17 @@
 #include "ctranslate2/primitives/primitives.h"
 
 #include <cmath>
+#include <type_traits>
+
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
-#include <thrust/device_vector.h>
 #include <thrust/iterator/discard_iterator.h>
-#include <thrust/iterator/transform_output_iterator.h>
 #include <cub/util_allocator.cuh>
 
-#include "../cuda/utils.h"
+#include "cuda/helpers.h"
+#include "type_dispatch.h"
 
 namespace ctranslate2 {
-
-  template <typename T, typename UnaryFunction>
-  void unary_transform(const T* x, T* y, dim_t size, UnaryFunction op) {
-    THRUST_CALL(thrust::transform, x, x + size, y, op);
-  }
-
-  template <typename T, typename BinaryFunction>
-  void binary_transform(const T* a, const T* b, T* c, dim_t size, BinaryFunction op) {
-    THRUST_CALL(thrust::transform, a, a + size, b, c, op);
-  }
-
-  template <typename T1, typename T2, typename T3, typename BinaryFunction, typename IndexFunction>
-  void binary_transform(T1 a, T2 b, T3 c, dim_t size,
-                        BinaryFunction op, IndexFunction index_a) {
-    auto index_it = thrust::make_transform_iterator(thrust::counting_iterator<dim_t>(0), index_a);
-    auto a_it = thrust::make_permutation_iterator(a, index_it);
-    THRUST_CALL(thrust::transform, a_it, a_it + size, b, c, op);
-  }
-
-  // perm_fun is a functor that takes the index in the permuted iterator and
-  // return the index in the original iterator.
-  template <typename T, typename PermFunction>
-  void permute(const T* x, T* y, dim_t size, PermFunction perm_fun) {
-    auto ind_it = thrust::counting_iterator<dim_t>(0);
-    auto perm_ind_it = thrust::make_transform_iterator(ind_it, perm_fun);
-    auto perm_it = thrust::make_permutation_iterator(x, perm_ind_it);
-    THRUST_CALL(thrust::copy_n, perm_it, size, y);
-  }
-
 
   static const cuda::CachingAllocatorConfig allocator_config = cuda::get_caching_allocator_config();
   static cub::CachingDeviceAllocator allocator(
@@ -61,15 +33,17 @@ namespace ctranslate2 {
   }
 
   template<>
-  void* primitives<Device::CUDA>::alloc_data(dim_t size) {
+  void* primitives<Device::CUDA>::alloc_data(dim_t size, int device_index) {
+    if (device_index < 0)
+      device_index = cub::CachingDeviceAllocator::INVALID_DEVICE_ORDINAL;
     void* data = nullptr;
-    CUDA_CHECK(allocator.DeviceAllocate(&data, size, cuda::get_cuda_stream()));
+    CUDA_CHECK(allocator.DeviceAllocate(device_index, &data, size, cuda::get_cuda_stream()));
     return data;
   }
 
   template<>
-  void primitives<Device::CUDA>::free_data(void* data) {
-    CUDA_CHECK(allocator.DeviceFree(data));
+  void primitives<Device::CUDA>::free_data(void* data, int device_index) {
+    CUDA_CHECK(allocator.DeviceFree(device_index, data));
   }
 
   template<>
@@ -88,7 +62,7 @@ namespace ctranslate2 {
   template<>
   template <typename T>
   void primitives<Device::CUDA>::fill(T* x, T a, dim_t size) {
-    THRUST_CALL(thrust::fill_n, x, size, a);
+    THRUST_CALL(thrust::fill, x, x + size, a);
   }
   template<>
   template <typename T>
@@ -96,7 +70,7 @@ namespace ctranslate2 {
     auto it = thrust::make_permutation_iterator(
       x, thrust::make_transform_iterator(thrust::counting_iterator<dim_t>(0),
                                          thrust::placeholders::_1 * inc_x));
-    THRUST_CALL(thrust::fill_n, it, size, a);
+    THRUST_CALL(thrust::fill, it, it + size, a);
   }
 
   template<>
@@ -107,218 +81,176 @@ namespace ctranslate2 {
   }
 
   template<>
+  template <typename U, typename V>
+  void primitives<Device::CUDA>::convert(const U* x, V* y, dim_t size) {
+    THRUST_CALL(thrust::copy,
+                cuda::device_cast(x), cuda::device_cast(x) + size, cuda::device_cast(y));
+  }
+
+  template void primitives<Device::CUDA>::convert(const float*, float16_t*, dim_t);
+  template void primitives<Device::CUDA>::convert(const float16_t*, float*, dim_t);
+
+  template<>
   template <typename T>
   T primitives<Device::CUDA>::sum(const T* array, dim_t size) {
-    return THRUST_CALL(thrust::reduce, array, array + size);
+    return T(THRUST_CALL(thrust::reduce,
+                         cuda::device_cast(array),
+                         cuda::device_cast(array) + size,
+                         cuda::device_type<T>(),
+                         cuda::plus<cuda::device_type<T>>()));
   }
 
   template<>
   template <typename T>
   dim_t primitives<Device::CUDA>::max_element(const T* array, dim_t size) {
-    const auto* max = THRUST_CALL(thrust::max_element, array, array + size);
-    return static_cast<dim_t>(max - array);
+    const auto* max = THRUST_CALL(thrust::max_element,
+                                  cuda::device_cast(array),
+                                  cuda::device_cast(array) + size,
+                                  cuda::maximum<cuda::device_type<T>>());
+    return static_cast<dim_t>(max - cuda::device_cast(array));
   }
 
   template<>
   template <typename T>
   T primitives<Device::CUDA>::max(const T* array, dim_t size) {
-    const auto* max = THRUST_CALL(thrust::max_element, array, array + size);
-    return deref(max, 0);
+    return deref(array, max_element(array, size));
+  }
+
+#if !CUDA_CAN_USE_HALF
+  namespace cuda {
+    template<>
+    struct maximum<thrust::tuple<__half, int32_t>> {
+      __host__ __device__ thrust::tuple<__half, int32_t>
+      operator()(const thrust::tuple<__half, int32_t>& lhs,
+                 const thrust::tuple<__half, int32_t>& rhs) const {
+        const float lv = float(lhs.get<0>());
+        const float rv = float(rhs.get<0>());
+        if (rv > lv)
+          return rhs;
+        if (lv < rv)
+          return lhs;
+        return lhs.get<1>() < rhs.get<1>() ? rhs : lhs;
+      }
+    };
+  }
+#endif
+
+  template<>
+  template <typename T>
+  void primitives<Device::CUDA>::row_max(const T* x,
+                                         const dim_t rows,
+                                         const dim_t cols,
+                                         T* values,
+                                         int32_t* indices) {
+    auto keys_it = thrust::make_transform_iterator(thrust::counting_iterator<int32_t>(0),
+                                                   cuda::repeat_vec_depth<int32_t>(cols));
+    auto ids_it = thrust::make_transform_iterator(thrust::counting_iterator<int32_t>(0),
+                                                  cuda::repeat_vec<int32_t>(cols));
+
+    THRUST_CALL(thrust::reduce_by_key,
+                keys_it, keys_it + (rows * cols),
+                thrust::make_zip_iterator(thrust::make_tuple(cuda::device_cast(x), ids_it)),
+                thrust::make_discard_iterator(),
+                thrust::make_zip_iterator(thrust::make_tuple(cuda::device_cast(values), indices)),
+                thrust::equal_to<int32_t>(),
+                cuda::maximum<thrust::tuple<cuda::device_type<T>, int32_t>>());
   }
 
   template<>
   template <typename T>
   void primitives<Device::CUDA>::add(T a, const T* x, T* y, dim_t size) {
-    unary_transform(x, y, size, thrust::placeholders::_1 + a);
+    using DeviceT = cuda::device_type<T>;
+    cuda::unary_transform(x, y, size, cuda::bind_right<cuda::plus, DeviceT>(DeviceT(a)));
   }
 
   template<>
   template <typename T>
   void primitives<Device::CUDA>::add(const T* a, const T* b, T* c, dim_t size) {
-    binary_transform(a, b, c, size, thrust::plus<T>());
+    cuda::binary_transform(a, b, c, size, cuda::plus<cuda::device_type<T>>());
   }
-
-  template <typename T>
-  struct repeat_vec : thrust::unary_function<T, T> {
-    T _size;
-    repeat_vec(T size)
-      : _size(size) {
-    }
-    __host__ __device__
-    T operator()(const T& i) {
-      return i % _size;
-    }
-  };
-
-  template <typename T>
-  struct repeat_vec_depth : thrust::unary_function<T, T> {
-    T _size;
-    repeat_vec_depth(T size)
-      : _size(size) {
-    }
-    __host__ __device__
-    T operator()(const T& i) {
-      return i / _size;
-    }
-  };
 
   template<>
   template <typename T>
   void primitives<Device::CUDA>::add_batch_broadcast(const T* a, const T* b, T* c,
                                                      dim_t a_size, dim_t b_size) {
-    binary_transform(a, b, c, b_size, thrust::plus<T>(), repeat_vec<dim_t>(a_size));
+    cuda::binary_transform(a, b, c, b_size,
+                           cuda::plus<cuda::device_type<T>>(),
+                           cuda::repeat_vec<dim_t>(a_size));
   }
 
   template<>
   template <typename T>
   void primitives<Device::CUDA>::add_depth_broadcast(const T* a, const T* b, T* c,
                                                      dim_t a_size, dim_t b_size) {
-    binary_transform(a, b, c, b_size, thrust::plus<T>(), repeat_vec_depth<dim_t>(b_size / a_size));
+    cuda::binary_transform(a, b, c, b_size,
+                           cuda::plus<cuda::device_type<T>>(),
+                           cuda::repeat_vec_depth<dim_t>(b_size / a_size));
   }
 
   template<>
   template <typename T>
   void primitives<Device::CUDA>::sub(const T* a, const T* b, T* c, dim_t size) {
-    binary_transform(a, b, c, size, thrust::minus<T>());
+    cuda::binary_transform(a, b, c, size, cuda::minus<cuda::device_type<T>>());
+  }
+
+  template<>
+  template <typename T>
+  void primitives<Device::CUDA>::min(T a, const T* x, T* y, dim_t size) {
+    using DeviceT = cuda::device_type<T>;
+    cuda::unary_transform(x, y, size, cuda::bind_right<cuda::minimum, DeviceT>(DeviceT(a)));
+  }
+
+  template<>
+  template <typename T>
+  void primitives<Device::CUDA>::min(const T* a, const T* b, T* c, dim_t size) {
+    cuda::binary_transform(a, b, c, size, cuda::minimum<cuda::device_type<T>>());
+  }
+
+  template<>
+  template <typename T>
+  void primitives<Device::CUDA>::max(T a, const T* x, T* y, dim_t size) {
+    using DeviceT = cuda::device_type<T>;
+    cuda::unary_transform(x, y, size, cuda::bind_right<cuda::maximum, DeviceT>(DeviceT(a)));
+  }
+
+  template<>
+  template <typename T>
+  void primitives<Device::CUDA>::max(const T* a, const T* b, T* c, dim_t size) {
+    cuda::binary_transform(a, b, c, size, cuda::maximum<cuda::device_type<T>>());
   }
 
   template<>
   template <typename T>
   void primitives<Device::CUDA>::mul(T a, const T* x, T* y, dim_t size) {
-    unary_transform(x, y, size, thrust::placeholders::_1 * a);
+    using DeviceT = cuda::device_type<T>;
+    cuda::unary_transform(x, y, size, cuda::bind_right<cuda::multiplies, DeviceT>(DeviceT(a)));
   }
 
   template<>
   template <typename T>
   void primitives<Device::CUDA>::mul(const T* a, const T* b, T* c, dim_t size) {
-    binary_transform(a, b, c, size, thrust::multiplies<T>());
+    cuda::binary_transform(a, b, c, size, cuda::multiplies<cuda::device_type<T>>());
   }
 
   template<>
   template <typename T>
   void primitives<Device::CUDA>::mul_batch_broadcast(const T* a, const T* b, T* c,
                                                      dim_t a_size, dim_t b_size) {
-    binary_transform(a, b, c, b_size, thrust::multiplies<T>(), repeat_vec<dim_t>(a_size));
+    cuda::binary_transform(a, b, c, b_size,
+                           cuda::multiplies<cuda::device_type<T>>(),
+                           cuda::repeat_vec<dim_t>(a_size));
   }
 
-  struct absolute_maximum_func : public thrust::binary_function<float, float, float> {
-    __host__ __device__
-    float operator()(float a, float b) {
-      return fmaxf(fabsf(a), fabsf(b));
-    }
-  };
-
+  template<>
   template <typename T>
-  class quantize_func : public thrust::binary_function<float, float, T> {
-  private:
-    float _shift;
-  public:
-    quantize_func(float shift)
-      : _shift(shift) {
-    }
-    __host__ __device__
-    T operator()(float scale, float x) {
-      return static_cast<T>(x * scale + _shift);
-    }
-  };
-
-  template<>
-  void primitives<Device::CUDA>::quantize_batch(const float* x,
-                                                float* scales,
-                                                int8_t* qx,
-                                                dim_t batch_size,
-                                                dim_t depth,
-                                                float shift) {
-    const dim_t size = batch_size * depth;
-
-    // Assign 1 key per batch.
-    auto keys_it = thrust::make_transform_iterator(thrust::counting_iterator<int>(0),
-                                                   repeat_vec_depth<int>(depth));
-
-    // scales = 127.0 / reduce_max(abs(x), axis=1)
-    THRUST_CALL(thrust::reduce_by_key,
-                keys_it, keys_it + size,
-                x,
-                thrust::make_discard_iterator(),
-                thrust::make_transform_output_iterator(
-                  scales, static_cast<float>(127) / thrust::placeholders::_1),
-                thrust::equal_to<int>(),
-                absolute_maximum_func());
-
-    // qx = x * expand_dims(scales, 1)
-    binary_transform(scales, x, qx, size,
-                     quantize_func<int8_t>(shift),
-                     repeat_vec_depth<dim_t>(depth));
+  void primitives<Device::CUDA>::relu(const T* x, T* y, dim_t size) {
+    max(T(0), x, y, size);
   }
 
-  template <typename T>
-  class dequantize_func : public thrust::binary_function<float, T, float> {
-  private:
-    float _shift;
-  public:
-    dequantize_func(float shift)
-      : _shift(shift) {
-    }
-    __device__
-    float operator()(float scale, T x) {
-      return __fdividef(static_cast<float>(x) - _shift, scale);
-    }
-  };
+  template void primitives<Device::CUDA>::relu(const float*, float*, dim_t);
+  template void primitives<Device::CUDA>::relu(const float16_t*, float16_t*, dim_t);
 
-  template<>
-  template<>
-  void primitives<Device::CUDA>::dequantize_batch(const int8_t* x, const float* scale, float* y,
-                                                  dim_t x_size, dim_t scale_size, float shift) {
-    binary_transform(scale, x, y, x_size,
-                     dequantize_func<int8_t>(shift),
-                     repeat_vec_depth<dim_t>(x_size / scale_size));
-  }
-
-  struct rescale_func : public thrust::binary_function<int32_t, thrust::tuple<float, float>, float> {
-    __device__
-    float operator()(int32_t x, const thrust::tuple<float, float>& scales) {
-      return __fdividef(__int2float_rn(x), (thrust::get<0>(scales) * thrust::get<1>(scales)));
-    }
-  };
-
-  template<>
-  void primitives<Device::CUDA>::rescale_output(const int32_t* x,
-                                                const float* input_scales,
-                                                const float* weight_scales,
-                                                float* y,
-                                                dim_t batch_size,
-                                                dim_t depth) {
-    const dim_t size = batch_size * depth;
-
-    // y = x / (expand_dims(input_scales, 1) * expand_dims(weight_scales, 0)
-    auto input_scales_it = thrust::make_permutation_iterator(
-      input_scales,
-      thrust::make_transform_iterator(thrust::counting_iterator<int>(0),
-                                      repeat_vec_depth<int>(depth)));
-    auto weight_scales_it = thrust::make_permutation_iterator(
-      weight_scales,
-      thrust::make_transform_iterator(thrust::counting_iterator<int>(0),
-                                      repeat_vec<int>(depth)));
-
-    auto scales_it = thrust::make_zip_iterator(thrust::make_tuple(input_scales_it, weight_scales_it));
-    THRUST_CALL(thrust::transform,
-                x, x + size,
-                scales_it,
-                y,
-                rescale_func());
-  }
-
-  struct relu_func : public thrust::unary_function<float, float> {
-    __host__ __device__
-    float operator()(float x) { return fmaxf(x, 0); }
-  };
-
-  template<>
-  void primitives<Device::CUDA>::relu(const float* x, float* y, dim_t size) {
-    unary_transform(x, y, size, relu_func());
-  }
-
-  struct gelu_func : public thrust::unary_function<float, float> {
+  struct gelu_func {
     float _scale;
     gelu_func(float scale)
       : _scale(scale) {
@@ -333,18 +265,18 @@ namespace ctranslate2 {
   void primitives<Device::CUDA>::gelu(const float* x, float* y, dim_t size) {
     static const float pi = std::acos(-1.f);
     static const float scale = std::sqrt(2.f / pi);
-    unary_transform(x, y, size, gelu_func(scale));
+    cuda::unary_transform(x, y, size, gelu_func(scale));
   }
 
   template <typename T>
-  struct perm_indices_2d : public thrust::unary_function<T, T> {
+  struct perm_indices_2d {
     T _rows, _cols;
     perm_indices_2d(T rows, T cols)
       : _rows(rows)
       , _cols(cols) {
     }
     __host__ __device__
-    T operator()(const T& i) const {
+    T operator()(const T i) const {
       const T i0 = i / _rows;
       const T i1 = i % _rows;
       return i1 * _cols + i0;
@@ -354,11 +286,11 @@ namespace ctranslate2 {
   template<>
   template <typename T>
   void primitives<Device::CUDA>::transpose_2d(const T* a, const dim_t* dims, T* b) {
-    permute(a, b, dims[0] * dims[1], perm_indices_2d<dim_t>(dims[0], dims[1]));
+    cuda::permute(a, b, dims[0] * dims[1], perm_indices_2d<dim_t>(dims[0], dims[1]));
   }
 
   template <typename T>
-  struct perm_indices_3d : public thrust::unary_function<T, T> {
+  struct perm_indices_3d {
     T _a_ps0, _a_ps1, _a_ps2; // Permuted strides of the original array.
     T _b_d0, _b_d1, _b_d2;    // Dimension of the permutated array.
     T _b_s0, _b_s1, _b_s2;    // Strides of the permutated array.
@@ -375,7 +307,7 @@ namespace ctranslate2 {
       _b_s2 = 1;
     }
     __host__ __device__
-    T operator()(const T& i) const {
+    T operator()(const T i) const {
       const T i0 = i / _b_s0;
       const T i1 = i / _b_s1 % _b_d1;
       const T i2 = i % _b_d2;
@@ -389,11 +321,11 @@ namespace ctranslate2 {
                                               const dim_t* dims,
                                               const dim_t* perm,
                                               T* b) {
-    permute(a, b, dims[0] * dims[1] * dims[2], perm_indices_3d<dim_t>(dims, perm));
+    cuda::permute(a, b, dims[0] * dims[1] * dims[2], perm_indices_3d<dim_t>(dims, perm));
   }
 
   template <typename T>
-  struct perm_indices_4d : public thrust::unary_function<T, T> {
+  struct perm_indices_4d {
     T _a_ps0, _a_ps1, _a_ps2, _a_ps3; // Permuted strides of the original array.
     T _b_d0, _b_d1, _b_d2, _b_d3;    // Dimension of the permutated array.
     T _b_s0, _b_s1, _b_s2, _b_s3;    // Strides of the permutated array.
@@ -413,7 +345,7 @@ namespace ctranslate2 {
       _b_s3 = 1;
     }
     __host__ __device__
-    T operator()(const T& i) const {
+    T operator()(const T i) const {
       const T i0 = i / _b_s0;
       const T i1 = i / _b_s1 % _b_d1;
       const T i2 = i / _b_s2 % _b_d2;
@@ -422,18 +354,63 @@ namespace ctranslate2 {
     }
   };
 
+  template <typename T>
+  __global__ void transpose_0213(const T* in,
+                                 const dim_t rows,
+                                 const dim_t cols,
+                                 const dim_t stride1,
+                                 const dim_t stride2,
+                                 T* out) {
+    const dim_t stride = stride1 * stride2;
+    for (dim_t bid = 0; bid < rows; bid += gridDim.x) {
+      const dim_t j = bid + blockIdx.x;
+      if (j < rows) {
+        const dim_t z = j / stride;
+        const dim_t y = (j % stride) / stride1;
+        const dim_t x = (j % stride) % stride1;
+        const dim_t j2 = z * stride + x * stride2 + y;
+
+        const T* row_in = in + j2 * cols;
+        T* row_out = out + j * cols;
+
+        for (dim_t tid = 0; tid < cols; tid += blockDim.x) {
+          const dim_t i = tid + threadIdx.x;
+          if (i < cols) {
+            row_out[i] = row_in[i];
+          }
+        }
+      }
+    }
+  }
+
   template<>
   template <typename T>
   void primitives<Device::CUDA>::transpose_4d(const T* a,
                                               const dim_t* dims,
                                               const dim_t* perm,
                                               T* b) {
-    permute(a, b, dims[0] * dims[1] * dims[2] * dims[3], perm_indices_4d<dim_t>(dims, perm));
+    if (perm[0] == 0 && perm[1] == 2 && perm[2] == 1 && perm[3] == 3) {
+      // Optimize the permutation used in multi-head attention.
+      const dim_t rows = dims[0] * dims[1] * dims[2];
+      const dim_t cols = dims[3];
+      const dim_t blocks = std::min(rows, cuda::max_blocks);
+      const dim_t threads = std::min(cols, cuda::max_threads);
+      transpose_0213<<<blocks, threads, 0, cuda::get_cuda_stream()>>>(a,
+                                                                      rows,
+                                                                      cols,
+                                                                      dims[1],
+                                                                      dims[2],
+                                                                      b);
+      return;
+    }
+
+    cuda::permute(a, b, dims[0] * dims[1] * dims[2] * dims[3], perm_indices_4d<dim_t>(dims, perm));
   }
 
   template<>
   template<>
   void primitives<Device::CUDA>::gemm(const float* a, const float* b,
+                                      bool, bool,
                                       bool transpose_a, bool transpose_b,
                                       dim_t m, dim_t n, dim_t k,
                                       float alpha, float beta,
@@ -460,7 +437,40 @@ namespace ctranslate2 {
 
   template<>
   template<>
+  void primitives<Device::CUDA>::gemm(const float16_t* a, const float16_t* b,
+                                      bool, bool,
+                                      bool transpose_a, bool transpose_b,
+                                      dim_t m, dim_t n, dim_t k,
+                                      float alpha, float beta,
+                                      float16_t* c,
+                                      const float16_t*) {
+    const int lda = transpose_a ? m : k;
+    const int ldb = transpose_b ? k : n;
+    const int ldc = n;
+
+    const cublasOperation_t transa = transpose_a ? CUBLAS_OP_T : CUBLAS_OP_N;
+    const cublasOperation_t transb = transpose_b ? CUBLAS_OP_T : CUBLAS_OP_N;
+
+    const __half alpha_h = alpha;
+    const __half beta_h = beta;
+
+    // cuBLAS assumes column-major storage, so swap a and b accordingly.
+    CUBLAS_CHECK(cublasGemmEx(cuda::get_cublas_handle(),
+                              transb, transa,
+                              n, m, k,
+                              &alpha_h,
+                              b, CUDA_R_16F, ldb,
+                              a, CUDA_R_16F, lda,
+                              &beta_h,
+                              c, CUDA_R_16F, ldc,
+                              CUDA_R_16F,
+                              CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+  }
+
+  template<>
+  template<>
   void primitives<Device::CUDA>::gemm(const int8_t* a, const int8_t* b,
+                                      bool, bool,
                                       bool transpose_a, bool transpose_b,
                                       dim_t m, dim_t n, dim_t k,
                                       float alpha, float beta,
@@ -521,38 +531,60 @@ namespace ctranslate2 {
                                            batch_size));
   }
 
-  struct exp_func : public thrust::unary_function<float, float> {
+  template<>
+  template<>
+  void primitives<Device::CUDA>::gemm_batch(const float16_t* a, const float16_t* b,
+                                            bool transpose_a, bool transpose_b,
+                                            dim_t batch_size,
+                                            dim_t m, dim_t n, dim_t k,
+                                            float alpha, float beta,
+                                            float16_t* c) {
+    const int lda = transpose_a ? m : k;
+    const int ldb = transpose_b ? k : n;
+    const int ldc = n;
+
+    const long long int stridea = m * k;
+    const long long int strideb = k * n;
+    const long long int stridec = m * n;
+
+    const cublasOperation_t transa = transpose_a ? CUBLAS_OP_T : CUBLAS_OP_N;
+    const cublasOperation_t transb = transpose_b ? CUBLAS_OP_T : CUBLAS_OP_N;
+
+    const __half alpha_h = alpha;
+    const __half beta_h = beta;
+
+    // cuBLAS assumes column-major storage, so swap a and b accordingly.
+    CUBLAS_CHECK(cublasGemmStridedBatchedEx(cuda::get_cublas_handle(),
+                                            transb, transa,
+                                            n, m, k,
+                                            &alpha_h,
+                                            b, CUDA_R_16F, ldb, strideb,
+                                            a, CUDA_R_16F, lda, stridea,
+                                            &beta_h,
+                                            c, CUDA_R_16F, ldc, stridec,
+                                            batch_size,
+                                            CUDA_R_16F,
+                                            CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+  }
+
+  struct exp_func {
     __host__ __device__
     float operator()(float x) { return expf(x); }
   };
 
   template<>
   void primitives<Device::CUDA>::exp(const float* x, float* y, dim_t size) {
-    unary_transform(x, y, size, exp_func());
+    cuda::unary_transform(x, y, size, exp_func());
   }
 
-  struct log_func : public thrust::unary_function<float, float> {
+  struct log_func {
     __host__ __device__
     float operator()(float x) { return logf(x); }
   };
 
   template<>
   void primitives<Device::CUDA>::log(const float* x, float* y, dim_t size) {
-    unary_transform(x, y, size, log_func());
-  }
-
-  struct pow_func : public thrust::unary_function<float, float> {
-    float _power;
-    pow_func(float power)
-      : _power(power) {
-    }
-    __host__ __device__
-    float operator()(float x) { return powf(x, _power); }
-  };
-
-  template<>
-  void primitives<Device::CUDA>::pow(const float* x, float* y, float power, dim_t size) {
-    unary_transform(x, y, size, pow_func(power));
+    cuda::unary_transform(x, y, size, log_func());
   }
 
 
@@ -584,6 +616,12 @@ namespace ctranslate2 {
   template T                                                            \
   primitives<Device::CUDA>::max(const T* array, dim_t size);            \
   template void                                                         \
+  primitives<Device::CUDA>::row_max(const T* x,                         \
+                                    const dim_t rows,                   \
+                                    const dim_t cols,                   \
+                                    T* values,                          \
+                                    int32_t* indices);                  \
+  template void                                                         \
   primitives<Device::CUDA>::add(T a, const T* x, T* y, dim_t size);     \
   template void                                                         \
   primitives<Device::CUDA>::add(const T* a, const T* b, T* c, dim_t size); \
@@ -595,6 +633,14 @@ namespace ctranslate2 {
                                                 T* c, dim_t a_size, dim_t b_size); \
   template void                                                         \
   primitives<Device::CUDA>::sub(const T* a, const T* b, T* c, dim_t size); \
+  template void                                                         \
+  primitives<Device::CUDA>::min(T a, const T* x, T* y, dim_t size);      \
+  template void                                                         \
+  primitives<Device::CUDA>::min(const T* a, const T* b, T* c, dim_t size); \
+  template void                                                         \
+  primitives<Device::CUDA>::max(T a, const T* x, T* y, dim_t size);     \
+  template void                                                         \
+  primitives<Device::CUDA>::max(const T* a, const T* b, T* c, dim_t size); \
   template void                                                         \
   primitives<Device::CUDA>::mul(T a, const T* x, T* y, dim_t size);     \
   template void                                                         \
@@ -624,3 +670,4 @@ namespace ctranslate2 {
   DECLARE_ALL_TYPES(DECLARE_IMPL)
 
 }
+

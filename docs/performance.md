@@ -24,7 +24,9 @@ where the columns mean:
 
 The list is ordered on 5. from the largest to smallest time.
 
-## CUDA caching allocator
+## GPU performance
+
+### CUDA caching allocator
 
 Allocating memory on the GPU with `cudaMalloc` is costly and is best avoided in high-performance code. For this reason CTranslate2 uses a [caching allocator](https://nvlabs.github.io/cub/structcub_1_1_caching_device_allocator.html) which enables a fast reuse of previously allocated buffers.
 
@@ -39,4 +41,43 @@ You can override these values by setting the environment variable `CT2_CUDA_CACH
 
 ```bash
 export CT2_CUDA_CACHING_ALLOCATOR_CONFIG=8,3,7,6291455
+```
+
+## CPU performance
+
+### Packed GEMM
+
+Packed GEMM could improve performance for single-core decoding. You can enable this mode by setting the environment variable `CT2_USE_EXPERIMENTAL_PACKED_GEMM=1`. See [Intel's article](https://software.intel.com/content/www/us/en/develop/articles/introducing-the-new-packed-apis-for-gemm.html) to learn more about packed GEMM.
+
+### Tuning `intra_threads` and `inter_threads`
+
+You can use the script `tools/tune_inter_intra.py` to find the threading configuration that maximizes the global throughput.
+Simply replace your call to `./build/cli/translate` by `python3 ./tools/tune_inter_intra.py ./build/cli/translate`. The script will run the translation multiple times and report the final tokens per second metric and the maximum memory usage for each threading combination.
+
+```bash
+head -n 100 valid.de | python3 ./tools/tune_inter_intra.py ./build/cli/translate --model ende_ctranslate2 --beam_size 2 > values.csv
+column -s, -t < out.csv | sort -k3 -r
+```
+```bash
+inter_threads  intra_threads  tokens/s  memory_used (in MB)
+4              2              919.333   918
+2              4              919.333   706
+1              8              919.333   557
+8              1              689.5     914
+7              1              689.5     910
+3              2              689.5     876
+2              3              689.5     731
+2              2              689.5     729
+1              5              689.5     562
+1              7              689.5     553
+1              4              689.5     553
+1              6              689.5     549
+5              1              551.6     914
+4              1              551.6     910
+6              1              551.6     869
+3              1              551.6     861
+1              3              551.6     567
+2              1              394.0     715
+1              2              394.0     562
+1              1              212.154   559
 ```

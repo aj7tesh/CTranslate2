@@ -1,6 +1,6 @@
 #include "ctranslate2/devices.h"
 
-#ifdef WITH_CUDA
+#ifdef CT2_WITH_CUDA
 #  include "./cuda/utils.h"
 #endif
 
@@ -9,22 +9,17 @@
 
 namespace ctranslate2 {
 
-  ComputeType str_to_compute_type(const std::string& compute_type) {
-    if (compute_type == "int8") return ctranslate2::ComputeType::INT8;
-    if (compute_type == "int16") return  ctranslate2::ComputeType::INT16;
-    if (compute_type == "float") return ctranslate2::ComputeType::FLOAT;
-    return ComputeType::DEFAULT;
-  }
-
   Device str_to_device(const std::string& device) {
-#ifdef WITH_CUDA
     if (device == "cuda" || device == "CUDA")
+#ifdef CT2_WITH_CUDA
       return Device::CUDA;
+#else
+      throw std::invalid_argument("This CTranslate2 package was not compiled with CUDA support");
 #endif
     if (device == "cpu" || device == "CPU")
       return Device::CPU;
     if (device == "auto" || device == "AUTO")
-#ifdef WITH_CUDA
+#ifdef CT2_WITH_CUDA
       return cuda::has_gpu() ? Device::CUDA : Device::CPU;
 #else
       return Device::CPU;
@@ -35,21 +30,29 @@ namespace ctranslate2 {
   std::string device_to_str(Device device) {
     switch (device) {
     case Device::CUDA:
-      return "CUDA";
+      return "cuda";
     case Device::CPU:
-      return "CPU";
+      return "cpu";
     }
     return "";
   }
 
+  template <Device D>
+  static void get_and_set_device(const int new_index, int* prev_index) {
+    *prev_index = primitives<D>::get_device();
+    primitives<D>::set_device(new_index);
+  }
+
   ScopedDeviceSetter::ScopedDeviceSetter(Device device, int index)
     : _device(device) {
-    DEVICE_DISPATCH(_device, _prev_index = primitives<D>::get_device());
-    DEVICE_DISPATCH(_device, primitives<D>::set_device(index));
+    DEVICE_DISPATCH(_device, get_and_set_device<D>(index, &_prev_index));
   }
 
   ScopedDeviceSetter::~ScopedDeviceSetter() {
-    DEVICE_DISPATCH(_device, primitives<D>::set_device(_prev_index));
+    try {
+      DEVICE_DISPATCH(_device, primitives<D>::set_device(_prev_index));
+    } catch (...) {
+    }
   }
 
 }

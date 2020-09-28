@@ -3,21 +3,32 @@
 #include <string>
 #include <vector>
 
-#include "models/model.h"
+#include "models/sequence_to_sequence.h"
 #include "translation_result.h"
 
 namespace ctranslate2 {
 
+  enum class BatchType {
+    Examples,
+    Tokens,
+  };
+
   struct TranslationOptions {
     // Maximum batch size to run the model on (set 0 to forward the input as is).
     // When more inputs are passed to translate(), they will be internally sorted by length
-    // to increase efficiency.
+    // and split to batches of size max_batch_size. Having inputs with similar lengths in a
+    // batch reduces the padding and so increases the computation efficiency.
     size_t max_batch_size = 0;
+
+    // Whether "max_batch_size" represents number of examples or tokens.
+    BatchType batch_type = BatchType::Examples;
 
     // Beam size to use for beam search (set 1 to run greedy search).
     size_t beam_size = 2;
     // Length penalty value to apply during beam search.
     float length_penalty = 0;
+    // Coverage value to apply during beam search.
+    float coverage_penalty = 0;
 
     // Decoding length constraints.
     size_t max_decoding_length = 250;
@@ -29,15 +40,22 @@ namespace ctranslate2 {
     // High temperature increase randomness.
     float sampling_temperature = 1;
 
-    // Use the vocabulary map included in the model directory.
+    // Allow using the vocabulary map included in the model directory, if it exists.
     bool use_vmap = false;
 
     // Number of hypotheses to store in the TranslationResult class (should be smaller than
-    // beam_size).
+    // beam_size unless return_alternatives is set).
     size_t num_hypotheses = 1;
 
+    // Store scores in the TranslationResult class.
+    bool return_scores = true;
     // Store attention vectors in the TranslationResult class.
     bool return_attention = false;
+
+    // Return alternatives at the first unconstrained decoding position. This is typically
+    // used with a target prefix to provide alternatives at a specifc location in the
+    // translation.
+    bool return_alternatives = false;
   };
 
   // This class holds all information required to translate from a model. Copying
@@ -45,7 +63,10 @@ namespace ctranslate2 {
   // be safely executed in parallel.
   class Translator {
   public:
-    Translator(const std::string& model_dir, Device device = Device::CPU, int device_index = 0);
+    Translator(const std::string& model_dir,
+               Device device = Device::CPU,
+               int device_index = 0,
+               ComputeType compute_type = ComputeType::DEFAULT);
     Translator(const std::shared_ptr<const models::Model>& model);
     Translator(const Translator& other);
 
@@ -73,15 +94,21 @@ namespace ctranslate2 {
     int device_index() const;
     ComputeType compute_type() const;
 
-    // Change only the model while keeping the same device and compute type.
+    // Change the model while keeping the same device and compute type as the previous model.
     void set_model(const std::string& model_dir);
+    void set_model(models::ModelReader& model_reader);
+
     void set_model(const std::shared_ptr<const models::Model>& model);
 
+    // Detach the model from this translator, which becomes unusable until set_model is called.
+    void detach_model();
+
   private:
-    void make_graph();
+    void assert_has_model() const;
 
     std::vector<TranslationResult>
     run_batch_translation_sorted(const std::vector<std::vector<std::string>>& source,
+                                 const std::vector<std::vector<std::string>>* target_prefix,
                                  const TranslationOptions& options);
     std::vector<TranslationResult>
     run_batch_translation(const std::vector<std::vector<std::string>>& source,
@@ -95,6 +122,30 @@ namespace ctranslate2 {
     std::shared_ptr<const models::Model> _model;
     std::unique_ptr<layers::Encoder> _encoder;
     std::unique_ptr<layers::Decoder> _decoder;
+    const VocabularyMap* _vocabulary_map;
+    const Vocabulary* _source_vocabulary;
+    const Vocabulary* _target_vocabulary;
   };
+
+
+  BatchType str_to_batch_type(const std::string& batch_type);
+
+  template <typename T>
+  size_t get_batch_size_increment(const std::vector<T>& example, const BatchType batch_type) {
+    switch (batch_type) {
+    case BatchType::Tokens:
+      return example.size();
+    default:
+      return 1;
+    };
+  }
+
+  template <typename T>
+  size_t get_batch_size(const std::vector<std::vector<T>>& examples, const BatchType batch_type) {
+    size_t batch_size = 0;
+    for (const std::vector<T>& example : examples)
+      batch_size += get_batch_size_increment(example, batch_type);
+    return batch_size;
+  }
 
 }
